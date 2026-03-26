@@ -44,50 +44,37 @@ void setup() {
     Serial.print(LORA_FREQ);
     Serial.println(" MHz...");
 
-    int state = radio.begin(
-        LORA_FREQ,
-        LORA_BW,
-        LORA_SF,
-        LORA_CR,
-        LORA_SYNC,
-        LORA_POWER,
-        LORA_PREAMBLE
-    );
-
-    if (state == RADIOLIB_ERR_NONE) {
-        Serial.println("[SX1262] LoRa initialized!");
-
-        // Configure TCXO voltage (mandatory for Wio-SX1262)
-        state = radio.setTCXO(LORA_TCXO_V);
-        if (state == RADIOLIB_ERR_NONE) {
-            Serial.println("[SX1262] TCXO set to 1.8V");
-        } else {
-            Serial.print("[SX1262] TCXO config failed, code: ");
-            Serial.println(state);
-        }
-
-        // Enable DIO2 as RF switch control (mandatory for Wio-SX1262)
-        state = radio.setDio2AsRfSwitch(true);
-        if (state == RADIOLIB_ERR_NONE) {
-            Serial.println("[SX1262] DIO2 RF switch enabled");
-        } else {
-            Serial.print("[SX1262] DIO2 RF switch failed, code: ");
-            Serial.println(state);
-        }
-
-        Serial.println();
-        Serial.println("LoRa initialized!");
-        Serial.println("All systems go.");
-    } else {
-        Serial.print("[SX1262] Init FAILED, code: ");
-        Serial.println(state);
-        Serial.println();
+    // Init order: begin() -> DIO2 RF switch -> TCXO (triggers calibrate) -> params
+    int state = radio.begin();
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[SX1262] Init FAILED, code: %d\n", state);
         Serial.println("Check wiring and board selection.");
-        Serial.print("  CS=");   Serial.println(LORA_CS);
-        Serial.print("  DIO1="); Serial.println(LORA_DIO1);
-        Serial.print("  RST=");  Serial.println(LORA_RESET);
-        Serial.print("  BUSY="); Serial.println(LORA_BUSY);
+        Serial.printf("  CS=%d  DIO1=%d  RST=%d  BUSY=%d\n",
+                      LORA_CS, LORA_DIO1, LORA_RESET, LORA_BUSY);
+        while (true) delay(1000);
     }
+
+    radio.setDio2AsRfSwitch(true);
+    Serial.println("[SX1262] DIO2 RF switch enabled");
+
+    state = radio.setTCXO(LORA_TCXO_V);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[SX1262] TCXO FAILED, code: %d\n", state);
+    } else {
+        Serial.println("[SX1262] TCXO set to 1.8V");
+    }
+
+    radio.setFrequency(LORA_FREQ);
+    radio.setBandwidth(LORA_BW);
+    radio.setSpreadingFactor(LORA_SF);
+    radio.setCodingRate(LORA_CR);
+    radio.setSyncWord(LORA_SYNC);
+    radio.setOutputPower(LORA_POWER);
+    radio.setPreambleLength(LORA_PREAMBLE);
+    radio.setCRC(2);
+
+    Serial.println();
+    Serial.println("LoRa initialized! All systems go.");
 }
 
 void loop() {

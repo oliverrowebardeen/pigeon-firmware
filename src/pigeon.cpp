@@ -19,6 +19,7 @@
 #include <Preferences.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
+#include <esp_bt.h>
 
 // ============================================================================
 // Configuration
@@ -75,6 +76,23 @@ static const size_t BLE_CHUNK_HEADER     = 22;
 static const size_t BLE_MAX_CHUNK_DATA   = 480;
 static const size_t BLE_REASM_SLOTS      = 4;
 static const uint32_t BLE_REASM_TIMEOUT  = 30000;
+
+// --- BLE event queue (thread-safe BLE callback -> loop() handoff) ---
+static const size_t BLE_EVENT_QUEUE_LEN  = 8;
+static const size_t BLE_MAX_WRITE_SIZE   = 512;
+// --- BLE advertising watchdog ---
+static const uint32_t BLE_ADV_RESTART_MS = 5000;
+
+enum BLEEventType : uint8_t {
+    BLE_EVENT_MSG_WRITE,
+    BLE_EVENT_ACK_WRITE,
+};
+
+struct BLEEvent {
+    BLEEventType type;
+    size_t len;
+    uint8_t data[BLE_MAX_WRITE_SIZE];
+};
 
 // ============================================================================
 // Data structures
@@ -144,7 +162,7 @@ BLECharacteristic* pMsgChar = nullptr;
 BLECharacteristic* pIdentityChar = nullptr;
 BLECharacteristic* pAckChar = nullptr;
 BLECharacteristic* pBridgeChar = nullptr;
-bool bleClientConnected = false;
+volatile bool bleClientConnected = false;
 
 // Queue for BLE->LoRa messages (phone wrote to us)
 static const size_t BLE_TX_QUEUE_SIZE = 4;
@@ -163,6 +181,10 @@ struct LoRaRxItem {
     bool pending;
 };
 LoRaRxItem loraRxQueue[LORA_RX_QUEUE_SIZE];
+
+// BLE event queue and advertising watchdog
+static QueueHandle_t bleEventQueue = nullptr;
+uint32_t lastBLEAdvRestart = 0;
 
 // ============================================================================
 // Utility functions
@@ -192,7 +214,8 @@ void computePigeonID(const uint8_t* pubKey, size_t keyLen, char* outHex) {
 }
 
 // Load or generate a 32-byte key, persist in NVS so it's stable across reboots.
-// X25519 accepts any 32-byte value as a valid public key.
+// This is a random 32-byte identity token, not a real Curve25519 key.
+// The iOS app uses it to derive pigeonID and identify this node.
 void loadOrGenerateKey() {
     Preferences prefs;
     prefs.begin("pigeon", false);
@@ -439,53 +462,42 @@ int loraReassemble(const uint8_t* sender, uint16_t fragGroupID,
 void handleLoRaReceive() {
     uint8_t buf[MAX_LORA_PACKET];
     int state = radio.readData(buf, MAX_LORA_PACKET);
-    if (state != RADIOLIB_ERR_NONE) {
-        if (state != -7) // Don't spam CRC errors
-            Serial.printf("[LORA] Read error: %d\n", state);
-        radio.startReceive();
-        return;
-    }
 
-    size_t len = radio.getPacketLength();
-    MeshPacket pkt;
-    if (!deserializePacket(buf, len, pkt)) {
-        radio.startReceive();
-        return;
-    }
+    if (state == RADIOLIB_ERR_NONE) {
+        size_t len = radio.getPacketLength();
+        MeshPacket pkt;
 
-    char senderStr[18];
-    macToStr(pkt.sender, senderStr);
+        if (deserializePacket(buf, len, pkt)) {
+            char senderStr[18];
+            macToStr(pkt.sender, senderStr);
 
-    // Dedup check
-    if (isDuplicate(pkt.sender, pkt.msgID)) {
-        radio.startReceive();
-        return;
-    }
-    addDedup(pkt.sender, pkt.msgID);
+            if (!isDuplicate(pkt.sender, pkt.msgID)) {
+                addDedup(pkt.sender, pkt.msgID);
 
-    bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
+                bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
 
-    // Parse fragment header from payload
-    if (pkt.payloadLen >= FRAG_HEADER_SIZE) {
-        uint16_t fragGroupID = ((uint16_t)pkt.payload[0] << 8) | pkt.payload[1];
-        uint8_t fragIndex = pkt.payload[2];
-        uint8_t fragTotal = pkt.payload[3];
-        const uint8_t* fragData = pkt.payload + FRAG_HEADER_SIZE;
-        size_t fragDataLen = pkt.payloadLen - FRAG_HEADER_SIZE;
+                // Reassemble fragments destined for us
+                if (forUs && pkt.payloadLen >= FRAG_HEADER_SIZE) {
+                    uint16_t fragGroupID = ((uint16_t)pkt.payload[0] << 8) | pkt.payload[1];
+                    uint8_t fragIndex = pkt.payload[2];
+                    uint8_t fragTotal = pkt.payload[3];
+                    const uint8_t* fragData = pkt.payload + FRAG_HEADER_SIZE;
+                    size_t fragDataLen = pkt.payloadLen - FRAG_HEADER_SIZE;
 
-        if (forUs) {
-            Serial.printf("[LORA RX] from=%s frag=%d/%d fragGroup=%04X\n",
-                          senderStr, fragIndex + 1, fragTotal, fragGroupID);
-            loraReassemble(pkt.sender, fragGroupID, fragIndex, fragTotal, fragData, fragDataLen);
+                    Serial.printf("[LORA RX] from=%s frag=%d/%d fragGroup=%04X\n",
+                                  senderStr, fragIndex + 1, fragTotal, fragGroupID);
+                    loraReassemble(pkt.sender, fragGroupID, fragIndex, fragTotal, fragData, fragDataLen);
+                }
+
+                // Relay if not from us and TTL allows
+                if (!addrMatch(pkt.sender, nodeAddr) && pkt.ttl > 1) {
+                    pkt.ttl--;
+                    meshTransmitRaw(pkt);
+                }
+            }
         }
-    }
-
-    // Relay if not from us and TTL allows
-    if (!addrMatch(pkt.sender, nodeAddr)) {
-        if (pkt.ttl > 1) {
-            pkt.ttl--;
-            meshTransmitRaw(pkt);
-        }
+    } else if (state != -7) { // Don't spam CRC errors
+        Serial.printf("[LORA] Read error: %d\n", state);
     }
 
     radio.startReceive();
@@ -537,8 +549,16 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
             if (!bleReasmTable[i].active) { slotIdx = i; break; }
         }
         if (slotIdx < 0) {
-            Serial.println("[BLE RX] No free reassembly slots");
-            return;
+            // Evict oldest slot
+            uint32_t oldest = UINT32_MAX;
+            slotIdx = 0;
+            for (int i = 0; i < (int)BLE_REASM_SLOTS; i++) {
+                if (bleReasmTable[i].timestamp < oldest) {
+                    oldest = bleReasmTable[i].timestamp;
+                    slotIdx = i;
+                }
+            }
+            Serial.println("[BLE RX] Evicting oldest reassembly slot");
         }
         memset(&bleReasmTable[slotIdx], 0, sizeof(BLEReasmSlot));
         memcpy(bleReasmTable[slotIdx].messageID, msgID, 16);
@@ -641,18 +661,34 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 class MsgCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pChar) override {
+        // Runs on Bluedroid task — enqueue for processing in loop()
         std::string val = pChar->getValue();
-        handleBLEChunkWrite((const uint8_t*)val.data(), val.length());
+        if (val.length() > 0 && bleEventQueue) {
+            BLEEvent evt;
+            evt.type = BLE_EVENT_MSG_WRITE;
+            evt.len = val.length();
+            if (evt.len > BLE_MAX_WRITE_SIZE) evt.len = BLE_MAX_WRITE_SIZE;
+            memcpy(evt.data, val.data(), evt.len);
+            if (xQueueSend(bleEventQueue, &evt, 0) != pdTRUE) {
+                Serial.println("[BLE] Event queue full, dropping write");
+            }
+        }
     }
 };
 
 class AckCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pChar) override {
-        // ACK from phone — forward over LoRa as broadcast
+        // Runs on Bluedroid task — enqueue for processing in loop()
         std::string val = pChar->getValue();
-        if (val.length() > 0) {
-            Serial.printf("[BLE ACK] Received %d bytes, broadcasting over LoRa\n", val.length());
-            meshSendFragmented(BROADCAST_ADDR, (const uint8_t*)val.data(), val.length());
+        if (val.length() > 0 && bleEventQueue) {
+            BLEEvent evt;
+            evt.type = BLE_EVENT_ACK_WRITE;
+            evt.len = val.length();
+            if (evt.len > BLE_MAX_WRITE_SIZE) evt.len = BLE_MAX_WRITE_SIZE;
+            memcpy(evt.data, val.data(), evt.len);
+            if (xQueueSend(bleEventQueue, &evt, 0) != pdTRUE) {
+                Serial.println("[BLE] Event queue full, dropping ACK");
+            }
         }
     }
 };
@@ -732,10 +768,19 @@ void setupBLE() {
 
     pService->start();
 
+    // Set BLE TX power to maximum for better discoverability
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
+    // Apple recommends 100-152.5ms advertising interval for accessories.
+    // Units are 0.625ms: 100ms = 0xA0, 152.5ms = 0xF4
+    pAdvertising->setMinInterval(0xA0);
+    pAdvertising->setMaxInterval(0xF4);
+    pAdvertising->setMinPreferred(0x06);  // 7.5ms min connection interval
+    pAdvertising->setMaxPreferred(0x0C);  // 15ms max connection interval
     BLEDevice::startAdvertising();
 
     Serial.printf("[BLE] GATT server started, advertising as 'Pigeon' (ID: %s)\n", nodePigeonID);
@@ -788,6 +833,10 @@ void setup() {
     // Derive pigeonID from publicKey (first 4 bytes of SHA256, matching iOS app)
     computePigeonID(nodePublicKey, 32, nodePigeonID);
 
+    // Randomize counters to avoid collisions after reboot
+    nextMsgID = (uint16_t)(esp_random() & 0xFFFF);
+    nextFragGroupID = (uint16_t)(esp_random() & 0xFFFF);
+
     char nodeStr[18];
     macToStr(nodeAddr, nodeStr);
 
@@ -805,6 +854,9 @@ void setup() {
     memset(bleTxQueue, 0, sizeof(bleTxQueue));
     memset(loraRxQueue, 0, sizeof(loraRxQueue));
 
+    // Create BLE event queue before starting BLE (callbacks use it)
+    bleEventQueue = xQueueCreate(BLE_EVENT_QUEUE_LEN, sizeof(BLEEvent));
+
     setupLoRa();
     setupBLE();
 
@@ -820,21 +872,41 @@ void loop() {
         handleLoRaReceive();
     }
 
-    // 2. Process BLE->LoRa queue (phone sent message, broadcast over mesh)
+    // 2. Process BLE event queue (thread-safe handoff from BLE callbacks)
+    BLEEvent evt;
+    while (xQueueReceive(bleEventQueue, &evt, 0) == pdTRUE) {
+        if (evt.type == BLE_EVENT_MSG_WRITE) {
+            handleBLEChunkWrite(evt.data, evt.len);
+        } else if (evt.type == BLE_EVENT_ACK_WRITE) {
+            Serial.printf("[BLE ACK] Received %d bytes, broadcasting over LoRa\n", evt.len);
+            meshSendFragmented(BROADCAST_ADDR, evt.data, evt.len);
+        }
+    }
+
+    // 3. Process BLE->LoRa queue (reassembled messages ready to send)
     for (int i = 0; i < (int)BLE_TX_QUEUE_SIZE; i++) {
         if (bleTxQueue[i].pending) {
-            Serial.printf("[BRIDGE] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
+            Serial.printf("[MESH] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
             meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
             bleTxQueue[i].pending = false;
         }
     }
 
-    // 3. Process LoRa->BLE queue (received from mesh, push to phone)
+    // 4. Process LoRa->BLE queue (received from mesh, push to phone)
     for (int i = 0; i < (int)LORA_RX_QUEUE_SIZE; i++) {
         if (loraRxQueue[i].pending) {
-            Serial.printf("[BRIDGE] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
+            Serial.printf("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
             bleSendChunked(pMsgChar, loraRxQueue[i].data, loraRxQueue[i].len);
             loraRxQueue[i].pending = false;
+        }
+    }
+
+    // 5. BLE advertising watchdog — restart if no client and interval elapsed
+    if (!bleClientConnected) {
+        uint32_t now = millis();
+        if (now - lastBLEAdvRestart >= BLE_ADV_RESTART_MS) {
+            lastBLEAdvRestart = now;
+            BLEDevice::startAdvertising();
         }
     }
 

@@ -23,7 +23,6 @@
 #define LORA_POWER      22      // dBm (max)
 #define LORA_PREAMBLE   8
 #define LORA_TCXO_V     1.8
-#define LORA_RXEN  38   // RX enable pin for RF switch
 
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_BUSY);
 
