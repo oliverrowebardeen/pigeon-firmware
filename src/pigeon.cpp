@@ -16,7 +16,9 @@
 #include <BLEServer.h>
 #include <BLE2902.h>
 #include <esp_mac.h>
+#include <Preferences.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/base64.h>
 
 // ============================================================================
 // Configuration
@@ -125,6 +127,8 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_BUSY);
 
 uint8_t nodeAddr[ADDR_LEN];
 char nodePigeonID[9]; // 8 hex chars + null
+uint8_t nodePublicKey[32]; // Curve25519 public key (persisted in NVS)
+char nodePublicKeyB64[45]; // base64-encoded public key
 uint16_t nextMsgID = 0;
 uint16_t nextFragGroupID = 0;
 
@@ -181,10 +185,33 @@ bool isBroadcast(const uint8_t* addr) {
     return addrMatch(addr, BROADCAST_ADDR);
 }
 
-void computePigeonID(const uint8_t* mac, char* outHex) {
+void computePigeonID(const uint8_t* pubKey, size_t keyLen, char* outHex) {
     uint8_t hash[32];
-    mbedtls_sha256(mac, ADDR_LEN, hash, 0);
+    mbedtls_sha256(pubKey, keyLen, hash, 0);
     snprintf(outHex, 9, "%02x%02x%02x%02x", hash[0], hash[1], hash[2], hash[3]);
+}
+
+// Load or generate a 32-byte key, persist in NVS so it's stable across reboots.
+// X25519 accepts any 32-byte value as a valid public key.
+void loadOrGenerateKey() {
+    Preferences prefs;
+    prefs.begin("pigeon", false);
+    size_t keyLen = prefs.getBytes("pubkey", nodePublicKey, 32);
+    if (keyLen != 32) {
+        // Generate new random key
+        esp_fill_random(nodePublicKey, 32);
+        prefs.putBytes("pubkey", nodePublicKey, 32);
+        Serial.println("[KEY] Generated new node key");
+    } else {
+        Serial.println("[KEY] Loaded existing node key from NVS");
+    }
+    prefs.end();
+
+    // Base64-encode the public key
+    size_t b64Len = 0;
+    mbedtls_base64_encode((unsigned char*)nodePublicKeyB64, sizeof(nodePublicKeyB64),
+                          &b64Len, nodePublicKey, 32);
+    nodePublicKeyB64[b64Len] = '\0';
 }
 
 // ============================================================================
@@ -666,15 +693,19 @@ void setupBLE() {
         BLE_IDENTITY_CHAR_UUID,
         BLECharacteristic::PROPERTY_READ
     );
-    // Set identity JSON value
-    char identityJson[256];
+    // Set identity JSON value — publicKey is REQUIRED by pigeon-ios
+    // isMeshNode distinguishes this from phones and internet bridges
+    char identityJson[512];
     snprintf(identityJson, sizeof(identityJson),
-        "{\"pigeonID\":\"%s\","
-        "\"displayName\":\"Pigeon Bridge\","
+        "{\"publicKey\":\"%s\","
+        "\"pigeonID\":\"%s\","
+        "\"displayName\":\"Pigeon Mesh Node\","
         "\"bridgeProtocolVersion\":1,"
-        "\"bridgeEnabled\":true,"
+        "\"bridgeEnabled\":false,"
+        "\"isMeshNode\":true,"
         "\"relayReachable\":false,"
-        "\"bridgeCapacityRemaining\":6}",
+        "\"bridgeCapacityRemaining\":0}",
+        nodePublicKeyB64,
         nodePigeonID
     );
     pIdentityChar->setValue(identityJson);
@@ -753,15 +784,18 @@ void setup() {
     delay(2000);
 
     esp_efuse_mac_get_default(nodeAddr);
-    computePigeonID(nodeAddr, nodePigeonID);
+    loadOrGenerateKey();
+    // Derive pigeonID from publicKey (first 4 bytes of SHA256, matching iOS app)
+    computePigeonID(nodePublicKey, 32, nodePigeonID);
 
     char nodeStr[18];
     macToStr(nodeAddr, nodeStr);
 
     Serial.println("=================================");
-    Serial.println("  Pigeon - Mesh + BLE Bridge");
+    Serial.println("  Pigeon Mesh Node");
     Serial.printf("  MAC: %s\n", nodeStr);
     Serial.printf("  Pigeon ID: %s\n", nodePigeonID);
+    Serial.printf("  Public Key: %s\n", nodePublicKeyB64);
     Serial.println("=================================");
     Serial.println();
 
