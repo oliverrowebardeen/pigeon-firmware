@@ -1361,19 +1361,18 @@ void loop() {
             lastPeerNotify = now;
             peerTableChanged = false;
 
-            // Build JSON: {"type":"peers","peers":[{"pigeonID":"...","rssi":-85},...]}
-            // Worst case: 16 peers × ~37 chars + envelope ≈ 620 bytes
-            char json[768];
-            int pos = snprintf(json, sizeof(json), "{\"type\":\"peers\",\"peers\":[");
+            // Build JSON: {"type":"peers","pigeonIDs":["a1b2c3d4","e5f6a7b8"]}
+            // Matches iOS app's expected format
+            char json[512];
+            int pos = snprintf(json, sizeof(json), "{\"type\":\"peers\",\"pigeonIDs\":[");
             bool first = true;
             for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
                 if (peerTable[i].active) {
-                    // Bounds check: leave room for closing "]}" (2) + comma (1) + entry (~40)
-                    if (pos + 45 >= (int)sizeof(json)) break;
+                    // Bounds check: leave room for closing "]}" (2) + comma (1) + entry (~12)
+                    if (pos + 15 >= (int)sizeof(json)) break;
                     if (!first) pos += snprintf(json + pos, sizeof(json) - pos, ",");
                     pos += snprintf(json + pos, sizeof(json) - pos,
-                                    "{\"pigeonID\":\"%s\",\"rssi\":%d}",
-                                    peerTable[i].pigeonID, (int)peerTable[i].rssi);
+                                    "\"%s\"", peerTable[i].pigeonID);
                     first = false;
                 }
             }
