@@ -21,6 +21,12 @@
 #include <mbedtls/base64.h>
 #include <esp_bt.h>
 #include <U8x8lib.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <ArduinoJson.h>
+#include <WebSocketsClient.h>
+#include "curve25519-donna.h"
+#include <mbedtls/md.h>
 
 // ============================================================================
 // Configuration
@@ -183,8 +189,9 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_BUSY);
 
 uint8_t nodeAddr[ADDR_LEN];
 char nodePigeonID[9]; // 8 hex chars + null
-uint8_t nodePublicKey[32]; // Curve25519 public key (persisted in NVS)
-char nodePublicKeyB64[45]; // base64-encoded public key
+uint8_t nodePublicKey[32];  // X25519 public key (persisted in NVS)
+uint8_t nodePrivateKey[32]; // X25519 private key (persisted in NVS)
+char nodePublicKeyB64[45];  // base64-encoded public key
 uint16_t nextMsgID = 0;
 uint16_t nextFragGroupID = 0;
 
@@ -262,6 +269,50 @@ bool hasRSSI = false;
 static const uint32_t BEACON_INTERVAL_MS = 30000;
 uint32_t lastBeaconTime = 0;
 
+// WiFi state
+static char wifiSSID[33] = {0};
+static char wifiPass[65] = {0};
+static bool wifiConfigured = false;
+static bool wifiConnected = false;
+static uint32_t lastWifiRetry = 0;
+static const uint32_t WIFI_RETRY_MS = 10000;
+
+// Bridge state
+enum BridgeState : uint8_t {
+    BRIDGE_NO_WIFI,
+    BRIDGE_CONNECTING,
+    BRIDGE_WIFI_ONLY,
+    BRIDGE_AUTH,
+    BRIDGE_ONLINE,
+    BRIDGE_OFFLINE
+};
+static BridgeState bridgeState = BRIDGE_NO_WIFI;
+
+// Relay server
+static const char* RELAY_HOST = "relay.example.com";
+static const uint16_t RELAY_PORT = 8080;
+static const char* RELAY_PATH = "/v1/ws";
+
+// WebSocket state
+WebSocketsClient webSocket;
+static bool wsConnected = false;
+static bool wsAuthenticated = false;
+static uint32_t wsReconnectDelay = 1000;
+static uint32_t wsLastAttempt = 0;
+static const uint32_t WS_MAX_BACKOFF = 60000;
+
+// Routing header: [message_id:16B UUID][recipient_hash:32B SHA-256]
+static const size_t ROUTING_HEADER_SIZE = 48;
+
+// Message-level dedup for internet<->LoRa bridging
+static const size_t MSG_DEDUP_SIZE = 32;
+struct MsgDedupEntry {
+    uint8_t msgId[16];
+    uint32_t timestamp;
+    bool active;
+};
+MsgDedupEntry msgDedupTable[MSG_DEDUP_SIZE];
+
 // ============================================================================
 // Utility functions
 // ============================================================================
@@ -273,6 +324,12 @@ void IRAM_ATTR onReceive() {
 // Forward declarations
 void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
                           uint8_t payloadLen, float rssi);
+void bleSendChunked(BLECharacteristic* pChar, const uint8_t* data, size_t dataLen);
+void saveWiFiCredentials(const char* ssid, const char* pass);
+void clearWiFiCredentials();
+void setupWiFi();
+void notifyBridgeStatus();
+void updateIdentityCharacteristic();
 
 void macToStr(const uint8_t* mac, char* buf) {
     snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -293,24 +350,42 @@ void computePigeonID(const uint8_t* pubKey, size_t keyLen, char* outHex) {
     snprintf(outHex, 9, "%02x%02x%02x%02x", hash[0], hash[1], hash[2], hash[3]);
 }
 
-// Load or generate a 32-byte key, persist in NVS so it's stable across reboots.
-// This is a random 32-byte identity token, not a real Curve25519 key.
-// The iOS app uses it to derive pigeonID and identify this node.
+// X25519 basepoint (generator) — the constant 9
+static const uint8_t X25519_BASEPOINT[32] = {9};
+
+// Load or generate X25519 keypair, persist in NVS.
+// Migration: if key_version < 2, the old random token is replaced with a real keypair.
 void loadOrGenerateKey() {
     Preferences prefs;
     prefs.begin("pigeon", false);
-    size_t keyLen = prefs.getBytes("pubkey", nodePublicKey, 32);
-    if (keyLen != 32) {
-        // Generate new random key
-        esp_fill_random(nodePublicKey, 32);
+
+    uint8_t keyVersion = prefs.getUChar("key_version", 0);
+    bool needNewKey = (keyVersion < 2);
+
+    if (!needNewKey) {
+        size_t privLen = prefs.getBytes("privkey", nodePrivateKey, 32);
+        if (privLen != 32) needNewKey = true;
+    }
+
+    if (needNewKey) {
+        esp_fill_random(nodePrivateKey, 32);
+        // Clamp per X25519 spec (RFC 7748)
+        nodePrivateKey[0]  &= 248;
+        nodePrivateKey[31] &= 127;
+        nodePrivateKey[31] |= 64;
+
+        curve25519_donna(nodePublicKey, nodePrivateKey, X25519_BASEPOINT);
+
+        prefs.putBytes("privkey", nodePrivateKey, 32);
         prefs.putBytes("pubkey", nodePublicKey, 32);
-        Serial.println("[KEY] Generated new node key");
+        prefs.putUChar("key_version", 2);
+        Serial.println("[KEY] Generated new X25519 keypair");
     } else {
-        Serial.println("[KEY] Loaded existing node key from NVS");
+        prefs.getBytes("pubkey", nodePublicKey, 32);
+        Serial.println("[KEY] Loaded existing X25519 keypair from NVS");
     }
     prefs.end();
 
-    // Base64-encode the public key
     size_t b64Len = 0;
     mbedtls_base64_encode((unsigned char*)nodePublicKeyB64, sizeof(nodePublicKeyB64),
                           &b64Len, nodePublicKey, 32);
@@ -712,72 +787,81 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
 // Phone registration (phone identifies itself to the node)
 // ============================================================================
 
-// Parse: {"type":"register","pigeonID":"a1b2c3d4"} or {"type":"register","pigeonID":"a1b2c3d4","publicKey":"..."}
 void handleBridgeWrite(const uint8_t* data, size_t len) {
-    // Null-terminate for string operations
-    char buf[BLE_MAX_WRITE_SIZE + 1];
-    size_t copyLen = len < BLE_MAX_WRITE_SIZE ? len : BLE_MAX_WRITE_SIZE;
-    memcpy(buf, data, copyLen);
-    buf[copyLen] = '\0';
-
-    // Simple JSON parsing — look for "type":"register" and "pigeonID":"XXXXXXXX"
-    if (strstr(buf, "\"register\"") == nullptr) {
-        Serial.printf("[BRIDGE] Unknown command: %s\n", buf);
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, data, len);
+    if (err) {
+        Serial.printf("[BRIDGE] JSON parse error: %s\n", err.c_str());
         return;
     }
 
-    // Extract pigeonID value
-    const char* pidKey = strstr(buf, "\"pigeonID\"");
-    if (!pidKey) {
-        Serial.println("[BRIDGE] Register missing pigeonID");
-        return;
-    }
-    // Find the value after the colon and opening quote
-    const char* p = pidKey + 10; // skip "pigeonID"
-    while (*p && *p != '"') p++;
-    if (!*p) return;
-    p++; // skip opening quote
-    // p now points to the start of the pigeonID value
-    const char* pidStart = p;
-    while (*p && *p != '"') p++;
-    size_t pidLen = p - pidStart;
-    if (pidLen != 8) {
-        Serial.printf("[BRIDGE] Invalid pigeonID length: %d\n", pidLen);
-        return;
-    }
-
-    char pigeonID[9];
-    memcpy(pigeonID, pidStart, 8);
-    pigeonID[8] = '\0';
-
-    // Convert hex pigeonID to 4 bytes
-    uint8_t pidBytes[PIGEON_ID_LEN];
-    for (int i = 0; i < (int)PIGEON_ID_LEN; i++) {
-        char hex[3] = {pigeonID[i*2], pigeonID[i*2+1], '\0'};
-        pidBytes[i] = (uint8_t)strtol(hex, nullptr, 16);
-    }
-
-    // Check if already registered
-    for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
-        if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pigeonID) == 0) {
-            Serial.printf("[BRIDGE] Phone %s already registered (slot %d)\n", pigeonID, i);
+    // WiFi provisioning: {"ssid":"...", "pass":"..."}
+    if (doc.containsKey("ssid")) {
+        const char* ssid = doc["ssid"];
+        const char* pass = doc["pass"] | "";
+        if (!ssid || strlen(ssid) == 0) {
+            Serial.println("[BRIDGE] Empty SSID, ignoring");
             return;
         }
+        Serial.printf("[BRIDGE] WiFi provisioning: SSID='%s'\n", ssid);
+        saveWiFiCredentials(ssid, pass);
+        setupWiFi();
+        notifyBridgeStatus();
+        return;
     }
 
-    // Find empty slot
-    for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
-        if (!registeredPhones[i].active) {
-            memcpy(registeredPhones[i].pigeonID, pigeonID, 9);
-            memcpy(registeredPhones[i].pigeonIDBytes, pidBytes, PIGEON_ID_LEN);
-            registeredPhones[i].connId = lastBLEConnId;
-            registeredPhones[i].active = true;
-            Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d)\n",
-                          pigeonID, i, lastBLEConnId);
+    // WiFi disconnect: {"wifi":"off"}
+    if (doc.containsKey("wifi")) {
+        const char* wifiCmd = doc["wifi"];
+        if (wifiCmd && strcmp(wifiCmd, "off") == 0) {
+            Serial.println("[BRIDGE] WiFi disconnect requested");
+            WiFi.disconnect(true);
+            clearWiFiCredentials();
+            notifyBridgeStatus();
+        }
+        return;
+    }
+
+    // Phone registration: {"type":"register","pigeonID":"a1b2c3d4"}
+    const char* cmdType = doc["type"];
+    if (cmdType && strcmp(cmdType, "register") == 0) {
+        const char* pigeonID = doc["pigeonID"];
+        if (!pigeonID || strlen(pigeonID) != 8) {
+            Serial.printf("[BRIDGE] Invalid pigeonID\n");
             return;
         }
+
+        uint8_t pidBytes[PIGEON_ID_LEN];
+        for (int i = 0; i < (int)PIGEON_ID_LEN; i++) {
+            char hex[3] = {pigeonID[i*2], pigeonID[i*2+1], '\0'};
+            pidBytes[i] = (uint8_t)strtol(hex, nullptr, 16);
+        }
+
+        // Check if already registered
+        for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+            if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pigeonID) == 0) {
+                Serial.printf("[BRIDGE] Phone %s already registered (slot %d)\n", pigeonID, i);
+                return;
+            }
+        }
+
+        // Find empty slot
+        for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+            if (!registeredPhones[i].active) {
+                strncpy(registeredPhones[i].pigeonID, pigeonID, 9);
+                memcpy(registeredPhones[i].pigeonIDBytes, pidBytes, PIGEON_ID_LEN);
+                registeredPhones[i].connId = lastBLEConnId;
+                registeredPhones[i].active = true;
+                Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d)\n",
+                              pigeonID, i, lastBLEConnId);
+                return;
+            }
+        }
+        Serial.println("[BRIDGE] Registration full, ignoring");
+        return;
     }
-    Serial.println("[BRIDGE] Registration full, ignoring");
+
+    Serial.printf("[BRIDGE] Unknown command\n");
 }
 
 // ============================================================================
@@ -863,6 +947,537 @@ uint8_t expirePeers() {
         }
     }
     return count;
+}
+
+// ============================================================================
+// Crypto helpers (ECDH auth)
+// ============================================================================
+
+// HKDF-SHA256 extract-then-expand (manual implementation since mbedtls_hkdf
+// is not always linked in Arduino ESP32 builds)
+bool hkdfSHA256(const uint8_t* salt, size_t saltLen,
+                const uint8_t* ikm, size_t ikmLen,
+                const uint8_t* info, size_t infoLen,
+                uint8_t* out, size_t outLen) {
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    // Extract: PRK = HMAC-SHA256(salt, IKM)
+    uint8_t prk[32];
+    if (mbedtls_md_hmac(md, salt, saltLen, ikm, ikmLen, prk) != 0) return false;
+    // Expand: T(1) = HMAC-SHA256(PRK, info || 0x01) — only need 32 bytes (one block)
+    if (outLen > 32) return false;
+    uint8_t expandInput[256];
+    if (infoLen + 1 > sizeof(expandInput)) return false;
+    memcpy(expandInput, info, infoLen);
+    expandInput[infoLen] = 0x01;
+    if (mbedtls_md_hmac(md, prk, 32, expandInput, infoLen + 1, out) != 0) return false;
+    return true;
+}
+
+bool hmacSHA256(const uint8_t* key, size_t keyLen,
+                const uint8_t* msg, size_t msgLen,
+                uint8_t* out) {
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return mbedtls_md_hmac(md, key, keyLen, msg, msgLen, out) == 0;
+}
+
+// Parse UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" to 16 raw bytes
+bool parseUUID(const char* uuid, uint8_t* out) {
+    int pos = 0;
+    for (int i = 0; uuid[i] && pos < 16; i++) {
+        if (uuid[i] == '-') continue;
+        char hex[3] = {uuid[i], uuid[i+1], 0};
+        out[pos++] = (uint8_t)strtol(hex, nullptr, 16);
+        i++;
+    }
+    return pos == 16;
+}
+
+// ============================================================================
+// Message-level dedup (internet<->LoRa bridging)
+// ============================================================================
+
+bool isMsgDuplicate(const uint8_t* msgId) {
+    uint32_t now = millis();
+    for (size_t i = 0; i < MSG_DEDUP_SIZE; i++) {
+        if (msgDedupTable[i].active) {
+            if (now - msgDedupTable[i].timestamp > 60000) {
+                msgDedupTable[i].active = false;
+                continue;
+            }
+            if (memcmp(msgDedupTable[i].msgId, msgId, 16) == 0) return true;
+        }
+    }
+    return false;
+}
+
+void addMsgDedup(const uint8_t* msgId) {
+    size_t slot = 0;
+    uint32_t oldest = UINT32_MAX;
+    for (size_t i = 0; i < MSG_DEDUP_SIZE; i++) {
+        if (!msgDedupTable[i].active) { slot = i; break; }
+        if (msgDedupTable[i].timestamp < oldest) {
+            oldest = msgDedupTable[i].timestamp;
+            slot = i;
+        }
+    }
+    memcpy(msgDedupTable[slot].msgId, msgId, 16);
+    msgDedupTable[slot].timestamp = millis();
+    msgDedupTable[slot].active = true;
+}
+
+// ============================================================================
+// WiFi connection subsystem
+// ============================================================================
+
+// Forward declarations
+void notifyBridgeStatus();
+void connectWebSocket();
+
+bool loadWiFiCredentials() {
+    Preferences prefs;
+    prefs.begin("pigeon", true);
+    String ssid = prefs.getString("wifi_ssid", "");
+    String pass = prefs.getString("wifi_pass", "");
+    prefs.end();
+
+    if (ssid.length() > 0) {
+        strncpy(wifiSSID, ssid.c_str(), sizeof(wifiSSID) - 1);
+        strncpy(wifiPass, pass.c_str(), sizeof(wifiPass) - 1);
+        wifiConfigured = true;
+        return true;
+    }
+    return false;
+}
+
+void saveWiFiCredentials(const char* ssid, const char* pass) {
+    Preferences prefs;
+    prefs.begin("pigeon", false);
+    prefs.putString("wifi_ssid", ssid);
+    prefs.putString("wifi_pass", pass);
+    prefs.end();
+
+    strncpy(wifiSSID, ssid, sizeof(wifiSSID) - 1);
+    strncpy(wifiPass, pass, sizeof(wifiPass) - 1);
+    wifiConfigured = true;
+}
+
+void clearWiFiCredentials() {
+    Preferences prefs;
+    prefs.begin("pigeon", false);
+    prefs.remove("wifi_ssid");
+    prefs.remove("wifi_pass");
+    prefs.end();
+
+    wifiSSID[0] = '\0';
+    wifiPass[0] = '\0';
+    wifiConfigured = false;
+    wifiConnected = false;
+    bridgeState = BRIDGE_NO_WIFI;
+}
+
+void setupWiFi() {
+    if (!wifiConfigured) {
+        Serial.println("[WIFI] No credentials configured");
+        bridgeState = BRIDGE_NO_WIFI;
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    Serial.printf("[WIFI] Connecting to '%s'...\n", wifiSSID);
+    WiFi.begin(wifiSSID, wifiPass);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    bridgeState = BRIDGE_CONNECTING;
+    lastWifiRetry = millis();
+}
+
+void wifiLoop() {
+    if (!wifiConfigured) return;
+
+    bool nowConnected = (WiFi.status() == WL_CONNECTED);
+
+    if (nowConnected && !wifiConnected) {
+        wifiConnected = true;
+        bridgeState = BRIDGE_WIFI_ONLY;
+        Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+        connectWebSocket();
+        notifyBridgeStatus();
+    } else if (!nowConnected && wifiConnected) {
+        wifiConnected = false;
+        wsConnected = false;
+        wsAuthenticated = false;
+        bridgeState = BRIDGE_CONNECTING;
+        Serial.println("[WIFI] Connection lost, will auto-reconnect");
+        notifyBridgeStatus();
+    } else if (!nowConnected) {
+        uint32_t now = millis();
+        if (now - lastWifiRetry >= WIFI_RETRY_MS) {
+            lastWifiRetry = now;
+            Serial.printf("[WIFI] Retrying '%s'...\n", wifiSSID);
+            WiFi.disconnect();
+            WiFi.begin(wifiSSID, wifiPass);
+        }
+    }
+}
+
+// ============================================================================
+// WebSocket relay connection
+// ============================================================================
+
+// Forward declarations
+void sendAuthHello();
+void handleAuthChallenge(JsonDocument& doc);
+void handleMsgDeliver(JsonDocument& doc);
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            Serial.println("[WS] Disconnected");
+            wsConnected = false;
+            wsAuthenticated = false;
+            bridgeState = wifiConnected ? BRIDGE_WIFI_ONLY : BRIDGE_CONNECTING;
+            notifyBridgeStatus();
+            break;
+
+        case WStype_CONNECTED:
+            Serial.printf("[WS] Connected to %s\n", (char*)payload);
+            wsConnected = true;
+            wsReconnectDelay = 1000;
+            bridgeState = BRIDGE_AUTH;
+            notifyBridgeStatus();
+            sendAuthHello();
+            break;
+
+        case WStype_TEXT: {
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, payload, length);
+            if (err) {
+                Serial.printf("[WS] JSON parse error: %s\n", err.c_str());
+                break;
+            }
+            const char* msgType = doc["type"];
+            if (!msgType) break;
+
+            if (strcmp(msgType, "auth_challenge") == 0) {
+                handleAuthChallenge(doc);
+            } else if (strcmp(msgType, "auth_ok") == 0) {
+                Serial.println("[AUTH] Authenticated!");
+                wsAuthenticated = true;
+                bridgeState = BRIDGE_ONLINE;
+                notifyBridgeStatus();
+            } else if (strcmp(msgType, "auth_error") == 0) {
+                Serial.printf("[AUTH] Auth failed: %s\n",
+                    doc["payload"]["reason"] | "unknown");
+                wsReconnectDelay = WS_MAX_BACKOFF;
+                webSocket.disconnect();
+            } else if (strcmp(msgType, "msg_deliver") == 0) {
+                handleMsgDeliver(doc);
+            } else if (strcmp(msgType, "msg_dup") == 0) {
+                Serial.printf("[BRIDGE] Server deduped message: %s\n",
+                    doc["payload"]["message_id"] | "?");
+            }
+            break;
+        }
+
+        case WStype_PING:
+        case WStype_PONG:
+            break;
+
+        default:
+            break;
+    }
+}
+
+void connectWebSocket() {
+    Serial.printf("[WS] Connecting to %s:%d%s\n", RELAY_HOST, RELAY_PORT, RELAY_PATH);
+    webSocket.begin(RELAY_HOST, RELAY_PORT, RELAY_PATH);
+    webSocket.onEvent(webSocketEvent);
+    webSocket.setReconnectInterval(0);
+    wsLastAttempt = millis();
+}
+
+void wsLoop() {
+    if (!wifiConnected) return;
+
+    webSocket.loop();
+
+    if (!wsConnected) {
+        uint32_t now = millis();
+        if (now - wsLastAttempt >= wsReconnectDelay) {
+            wsLastAttempt = now;
+            wsReconnectDelay = min(wsReconnectDelay * 2, WS_MAX_BACKOFF);
+            connectWebSocket();
+        }
+    }
+}
+
+// ============================================================================
+// ECDH auth handshake
+// ============================================================================
+
+void sendAuthHello() {
+    char json[128];
+    snprintf(json, sizeof(json),
+        "{\"type\":\"auth_hello\",\"payload\":{\"public_key_b64\":\"%s\"}}",
+        nodePublicKeyB64);
+    webSocket.sendTXT(json);
+    Serial.println("[AUTH] Sent auth_hello");
+}
+
+void handleAuthChallenge(JsonDocument& doc) {
+    const char* ephPubB64 = doc["payload"]["ephemeral_public_key_b64"];
+    const char* nonceB64 = doc["payload"]["nonce_b64"];
+    const char* challengeId = doc["payload"]["challenge_id"];
+    int64_t issuedAt = doc["payload"]["issued_at"];
+
+    if (!ephPubB64 || !nonceB64 || !challengeId) {
+        Serial.println("[AUTH] Invalid auth_challenge: missing fields");
+        return;
+    }
+
+    uint8_t serverEphPub[32];
+    size_t decoded = 0;
+    mbedtls_base64_decode(serverEphPub, 32, &decoded,
+                          (const unsigned char*)ephPubB64, strlen(ephPubB64));
+    if (decoded != 32) {
+        Serial.println("[AUTH] Invalid ephemeral public key length");
+        return;
+    }
+
+    uint8_t nonce[32];
+    mbedtls_base64_decode(nonce, 32, &decoded,
+                          (const unsigned char*)nonceB64, strlen(nonceB64));
+    if (decoded != 32) {
+        Serial.println("[AUTH] Invalid nonce length");
+        return;
+    }
+
+    uint8_t challengeIdBytes[16];
+    if (!parseUUID(challengeId, challengeIdBytes)) {
+        Serial.println("[AUTH] Invalid challenge_id UUID");
+        return;
+    }
+
+    // X25519 ECDH
+    uint8_t sharedSecret[32];
+    curve25519_donna(sharedSecret, nodePrivateKey, serverEphPub);
+
+    // RFC 7748 section 6.1: abort if shared secret is all-zero
+    uint8_t zero[32] = {0};
+    if (memcmp(sharedSecret, zero, 32) == 0) {
+        Serial.println("[AUTH] ECDH produced zero shared secret — aborting");
+        webSocket.disconnect();
+        return;
+    }
+
+    // HKDF-SHA256
+    const char* salt = "pigeon-relay-auth-v1";
+    uint8_t info[80]; // 16 + 32 + 32
+    memcpy(info, challengeIdBytes, 16);
+    memcpy(info + 16, nonce, 32);
+    memcpy(info + 48, nodePublicKey, 32);
+
+    uint8_t authKey[32];
+    if (!hkdfSHA256((const uint8_t*)salt, strlen(salt),
+                    sharedSecret, 32, info, 80, authKey, 32)) {
+        Serial.println("[AUTH] HKDF failed");
+        return;
+    }
+
+    // HMAC-SHA256
+    uint8_t hmacInput[24]; // 16 + 8
+    memcpy(hmacInput, challengeIdBytes, 16);
+    for (int i = 7; i >= 0; i--) {
+        hmacInput[16 + (7 - i)] = (uint8_t)(issuedAt >> (i * 8));
+    }
+
+    uint8_t proof[32];
+    if (!hmacSHA256(authKey, 32, hmacInput, 24, proof)) {
+        Serial.println("[AUTH] HMAC failed");
+        return;
+    }
+
+    char proofB64[45];
+    size_t proofB64Len = 0;
+    mbedtls_base64_encode((unsigned char*)proofB64, sizeof(proofB64),
+                          &proofB64Len, proof, 32);
+    proofB64[proofB64Len] = '\0';
+
+    char json[256];
+    snprintf(json, sizeof(json),
+        "{\"type\":\"auth_prove\",\"payload\":{\"challenge_id\":\"%s\",\"proof_b64\":\"%s\"}}",
+        challengeId, proofB64);
+    webSocket.sendTXT(json);
+    Serial.println("[AUTH] Sent auth_prove");
+}
+
+// ============================================================================
+// Message bridging
+// ============================================================================
+
+void bridgeToRelay(const uint8_t* data, size_t len) {
+    if (!wsAuthenticated || len < ROUTING_HEADER_SIZE) return;
+
+    const uint8_t* msgIdBytes = data;
+    const uint8_t* recipientHash = data + 16;
+    const uint8_t* envelope = data + ROUTING_HEADER_SIZE;
+    size_t envelopeLen = len - ROUTING_HEADER_SIZE;
+
+    // Don't re-bridge messages we received from the internet
+    if (isMsgDuplicate(msgIdBytes)) return;
+
+    char msgIdStr[37];
+    snprintf(msgIdStr, sizeof(msgIdStr),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        msgIdBytes[0], msgIdBytes[1], msgIdBytes[2], msgIdBytes[3],
+        msgIdBytes[4], msgIdBytes[5], msgIdBytes[6], msgIdBytes[7],
+        msgIdBytes[8], msgIdBytes[9], msgIdBytes[10], msgIdBytes[11],
+        msgIdBytes[12], msgIdBytes[13], msgIdBytes[14], msgIdBytes[15]);
+
+    char recipientHex[65];
+    for (int i = 0; i < 32; i++) {
+        snprintf(recipientHex + i * 2, 3, "%02x", recipientHash[i]);
+    }
+
+    size_t b64BufSize = 4 * ((envelopeLen + 2) / 3) + 1;
+    char* envelopeB64 = (char*)malloc(b64BufSize);
+    if (!envelopeB64) {
+        Serial.println("[BRIDGE] malloc failed for envelope base64");
+        return;
+    }
+    size_t b64Len = 0;
+    mbedtls_base64_encode((unsigned char*)envelopeB64, b64BufSize,
+                          &b64Len, envelope, envelopeLen);
+    envelopeB64[b64Len] = '\0';
+
+    size_t jsonBufSize = 128 + 36 + 64 + b64Len;
+    char* json = (char*)malloc(jsonBufSize);
+    if (!json) {
+        free(envelopeB64);
+        Serial.println("[BRIDGE] malloc failed for JSON");
+        return;
+    }
+    snprintf(json, jsonBufSize,
+        "{\"type\":\"msg_send\",\"payload\":"
+        "{\"message_id\":\"%s\",\"recipient_hash_hex\":\"%s\",\"envelope_b64\":\"%s\"}}",
+        msgIdStr, recipientHex, envelopeB64);
+
+    webSocket.sendTXT(json);
+    Serial.printf("[BRIDGE] LoRa->Relay: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+
+    free(envelopeB64);
+    free(json);
+}
+
+void handleMsgDeliver(JsonDocument& doc) {
+    const char* msgIdStr = doc["payload"]["message_id"];
+    const char* recipientHashHex = doc["payload"]["recipient_hash_hex"];
+    const char* envelopeB64 = doc["payload"]["envelope_b64"];
+
+    if (!msgIdStr || !recipientHashHex || !envelopeB64) {
+        Serial.println("[BRIDGE] Invalid msg_deliver: missing fields");
+        return;
+    }
+    if (strlen(recipientHashHex) != 64) {
+        Serial.println("[BRIDGE] Invalid recipient_hash_hex length");
+        return;
+    }
+
+    uint8_t msgIdBytes[16];
+    if (!parseUUID(msgIdStr, msgIdBytes)) {
+        Serial.println("[BRIDGE] Invalid message_id UUID");
+        return;
+    }
+
+    if (isMsgDuplicate(msgIdBytes)) {
+        Serial.printf("[BRIDGE] Duplicate msg_deliver: %s\n", msgIdStr);
+        return;
+    }
+    addMsgDedup(msgIdBytes);
+
+    uint8_t recipientHash[32];
+    for (int i = 0; i < 32; i++) {
+        char hex[3] = {recipientHashHex[i*2], recipientHashHex[i*2+1], 0};
+        recipientHash[i] = (uint8_t)strtol(hex, nullptr, 16);
+    }
+
+    size_t envelopeB64Len = strlen(envelopeB64);
+    size_t maxDecoded = envelopeB64Len;
+    uint8_t* envelope = (uint8_t*)malloc(maxDecoded);
+    if (!envelope) {
+        Serial.println("[BRIDGE] malloc failed for envelope decode");
+        return;
+    }
+    size_t envelopeLen = 0;
+    mbedtls_base64_decode(envelope, maxDecoded, &envelopeLen,
+                          (const unsigned char*)envelopeB64, envelopeB64Len);
+
+    size_t fullLen = ROUTING_HEADER_SIZE + envelopeLen;
+    uint8_t* fullMsg = (uint8_t*)malloc(fullLen);
+    if (!fullMsg) {
+        free(envelope);
+        Serial.println("[BRIDGE] malloc failed for full message");
+        return;
+    }
+    memcpy(fullMsg, msgIdBytes, 16);
+    memcpy(fullMsg + 16, recipientHash, 32);
+    memcpy(fullMsg + ROUTING_HEADER_SIZE, envelope, envelopeLen);
+    free(envelope);
+
+    Serial.printf("[BRIDGE] Relay->LoRa: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+
+    meshSendFragmented(BROADCAST_ADDR, fullMsg, fullLen);
+    bleSendChunked(pMsgChar, fullMsg, fullLen);
+
+    free(fullMsg);
+
+    char ackJson[128];
+    snprintf(ackJson, sizeof(ackJson),
+        "{\"type\":\"msg_ack\",\"payload\":{\"message_id\":\"%s\"}}", msgIdStr);
+    webSocket.sendTXT(ackJson);
+}
+
+// ============================================================================
+// Identity and bridge status notifications
+// ============================================================================
+
+void updateIdentityCharacteristic() {
+    if (!pIdentityChar) return;
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"publicKey\":\"%s\","
+        "\"pigeonID\":\"%s\","
+        "\"displayName\":\"Pigeon Mesh Node\","
+        "\"bridgeProtocolVersion\":1,"
+        "\"bridgeEnabled\":%s,"
+        "\"isMeshNode\":true,"
+        "\"relayReachable\":%s,"
+        "\"bridgeCapacityRemaining\":0}",
+        nodePublicKeyB64,
+        nodePigeonID,
+        wifiConfigured ? "true" : "false",
+        (bridgeState == BRIDGE_ONLINE) ? "true" : "false"
+    );
+    pIdentityChar->setValue(json);
+}
+
+void notifyBridgeStatus() {
+    updateIdentityCharacteristic();
+    if (!pBridgeChar || !bleClientConnected) return;
+
+    char json[128];
+    if (bridgeState == BRIDGE_ONLINE) {
+        snprintf(json, sizeof(json),
+            "{\"type\":\"bridge_status\",\"bridge\":\"online\",\"ssid\":\"%s\",\"ip\":\"%s\"}",
+            wifiSSID, WiFi.localIP().toString().c_str());
+    } else if (bridgeState == BRIDGE_NO_WIFI) {
+        snprintf(json, sizeof(json), "{\"type\":\"bridge_status\",\"bridge\":\"no_wifi\"}");
+    } else {
+        snprintf(json, sizeof(json),
+            "{\"type\":\"bridge_status\",\"bridge\":\"connecting\",\"ssid\":\"%s\"}", wifiSSID);
+    }
+    pBridgeChar->setValue(json);
+    pBridgeChar->notify();
 }
 
 // ============================================================================
@@ -1011,22 +1626,8 @@ void setupBLE() {
         BLE_IDENTITY_CHAR_UUID,
         BLECharacteristic::PROPERTY_READ
     );
-    // Set identity JSON value — publicKey is REQUIRED by pigeon-ios
-    // isMeshNode distinguishes this from phones and internet bridges
-    char identityJson[512];
-    snprintf(identityJson, sizeof(identityJson),
-        "{\"publicKey\":\"%s\","
-        "\"pigeonID\":\"%s\","
-        "\"displayName\":\"Pigeon Mesh Node\","
-        "\"bridgeProtocolVersion\":1,"
-        "\"bridgeEnabled\":false,"
-        "\"isMeshNode\":true,"
-        "\"relayReachable\":false,"
-        "\"bridgeCapacityRemaining\":0}",
-        nodePublicKeyB64,
-        nodePigeonID
-    );
-    pIdentityChar->setValue(identityJson);
+    // Set identity JSON — updated dynamically as bridge state changes
+    updateIdentityCharacteristic();
 
     // ACK characteristic: Write + WriteWithoutResponse + Notify
     pAckChar = pService->createCharacteristic(
@@ -1145,24 +1746,28 @@ void updateDisplay() {
              (unsigned)countMeshNodes());
     u8x8.print(line);
 
-    // Mesh-reachable peers (phones on other nodes)
-    uint8_t peerCount = 0;
-    for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
-        if (peerTable[i].active) peerCount++;
-    }
+    // RSSI
     u8x8.setCursor(0, 4);
-    snprintf(line, sizeof(line), "Peers:  %-8u", (unsigned)peerCount);
+    if (hasRSSI) {
+        snprintf(line, sizeof(line), "RSSI: %d dBm    ", (int)lastRSSI);
+    } else {
+        snprintf(line, sizeof(line), "RSSI: --        ");
+    }
     u8x8.print(line);
 
-    // Last received signal strength
+    // Bridge status
     u8x8.setCursor(0, 5);
-    if (hasRSSI) {
-        char rssi[11];
-        snprintf(rssi, sizeof(rssi), "%d dBm", (int)lastRSSI);
-        snprintf(line, sizeof(line), "RSSI: %-10s", rssi);
-    } else {
-        snprintf(line, sizeof(line), "RSSI: %-10s", "--");
+    const char* bStatus;
+    switch (bridgeState) {
+        case BRIDGE_NO_WIFI:   bStatus = "No WiFi";    break;
+        case BRIDGE_CONNECTING: bStatus = "Connecting"; break;
+        case BRIDGE_WIFI_ONLY: bStatus = "WiFi Only";  break;
+        case BRIDGE_AUTH:      bStatus = "Auth...";     break;
+        case BRIDGE_ONLINE:    bStatus = "Online";      break;
+        case BRIDGE_OFFLINE:   bStatus = "Offline";     break;
+        default:               bStatus = "?";           break;
     }
+    snprintf(line, sizeof(line), "Bridge:%-9s", bStatus);
     u8x8.print(line);
 
     // LoRa packet stats
@@ -1227,12 +1832,16 @@ void setup() {
     memset(registeredPhones, 0, sizeof(registeredPhones));
     memset(peerTable, 0, sizeof(peerTable));
     memset(relayQueue, 0, sizeof(relayQueue));
+    memset(msgDedupTable, 0, sizeof(msgDedupTable));
 
     // Create BLE event queue before starting BLE (callbacks use it)
     bleEventQueue = xQueueCreate(BLE_EVENT_QUEUE_LEN, sizeof(BLEEvent));
 
     setupLoRa();
     setupBLE();
+
+    loadWiFiCredentials();
+    setupWiFi();
 
     // Offset beacon timing so nodes don't all beacon at the same instant
     lastBeaconTime = millis() - BEACON_INTERVAL_MS + (nodeAddr[5] * 37 % BEACON_INTERVAL_MS);
@@ -1271,6 +1880,7 @@ void loop() {
         if (bleTxQueue[i].pending) {
             Serial.printf("[MESH] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
             meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
+            bridgeToRelay(bleTxQueue[i].data, bleTxQueue[i].len);
             bleTxQueue[i].pending = false;
             statBleIn++;
         }
@@ -1281,6 +1891,7 @@ void loop() {
         if (loraRxQueue[i].pending) {
             Serial.printf("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
             bleSendChunked(pMsgChar, loraRxQueue[i].data, loraRxQueue[i].len);
+            bridgeToRelay(loraRxQueue[i].data, loraRxQueue[i].len);
             loraRxQueue[i].pending = false;
             statBleOut++;
         }
@@ -1393,7 +2004,13 @@ void loop() {
         }
     }
 
-    // 9. BLE advertising watchdog — restart if no client and interval elapsed
+    // 9. WiFi connection management
+    wifiLoop();
+
+    // 10. WebSocket relay connection
+    wsLoop();
+
+    // 11. BLE advertising watchdog — restart if no client and interval elapsed
     if (!bleClientConnected) {
         uint32_t now = millis();
         if (now - lastBLEAdvRestart >= BLE_ADV_RESTART_MS) {
@@ -1402,7 +2019,7 @@ void loop() {
         }
     }
 
-    // 10. Update OLED display every second
+    // 12. Update OLED display every second
     {
         uint32_t now = millis();
         if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
