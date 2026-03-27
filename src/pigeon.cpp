@@ -84,15 +84,52 @@ static const size_t BLE_MAX_WRITE_SIZE   = 512;
 // --- BLE advertising watchdog ---
 static const uint32_t BLE_ADV_RESTART_MS = 5000;
 
+// --- Phone registration (phones identify themselves to the node) ---
+static const size_t MAX_REGISTERED_PHONES = 3;
+static const size_t PIGEON_ID_LEN         = 4;   // 4 bytes = 8 hex chars
+
+// --- Peer discovery (mesh-reachable phones via LoRa beacons) ---
+static const size_t PEER_TABLE_SIZE       = 16;
+static const uint32_t PEER_EXPIRY_MS      = 90000; // 3× beacon interval
+static const uint32_t PEER_NOTIFY_MS      = 10000; // BLE notification interval
+static const uint8_t BEACON_TYPE_PRESENCE = 0x01;  // Distinguishes beacons from fragments
+
+// --- Relay queue (deferred relay to avoid fragment loss) ---
+static const size_t RELAY_QUEUE_SIZE      = 8;
+
+// --- Radio watchdog ---
+static const uint32_t RADIO_WATCHDOG_MS   = 5000;
+
 enum BLEEventType : uint8_t {
     BLE_EVENT_MSG_WRITE,
     BLE_EVENT_ACK_WRITE,
+    BLE_EVENT_BRIDGE_WRITE,
 };
 
 struct BLEEvent {
     BLEEventType type;
     size_t len;
     uint8_t data[BLE_MAX_WRITE_SIZE];
+};
+
+struct RegisteredPhone {
+    char pigeonID[9];       // 8 hex chars + null
+    uint8_t pigeonIDBytes[PIGEON_ID_LEN]; // Binary form for beacon payload
+    uint16_t connId;        // BLE connection ID to track disconnects
+    bool active;
+};
+
+struct PeerEntry {
+    char pigeonID[9];       // 8 hex chars + null
+    uint32_t lastSeen;      // millis() timestamp
+    float rssi;             // Signal strength from beacon
+    bool active;
+};
+
+struct RelayItem {
+    uint8_t data[MAX_LORA_PACKET];
+    size_t len;
+    bool pending;
 };
 
 // ============================================================================
@@ -187,6 +224,27 @@ LoRaRxItem loraRxQueue[LORA_RX_QUEUE_SIZE];
 static QueueHandle_t bleEventQueue = nullptr;
 uint32_t lastBLEAdvRestart = 0;
 
+// Phone registration (phones connected via BLE that have identified themselves)
+RegisteredPhone registeredPhones[MAX_REGISTERED_PHONES];
+
+// Peer table (mesh-reachable phones discovered via LoRa beacons)
+PeerEntry peerTable[PEER_TABLE_SIZE];
+uint32_t lastPeerNotify = 0;
+bool peerTableChanged = false;
+
+// Relay queue (deferred relay to prevent fragment loss)
+RelayItem relayQueue[RELAY_QUEUE_SIZE];
+
+// Radio watchdog
+uint32_t lastRadioWatchdog = 0;
+
+// Track the most recent BLE connection ID for associating with phone registration
+uint16_t lastBLEConnId = 0;
+
+// Relay jitter (random delay to reduce collision between relay nodes)
+uint32_t lastRelayTime = 0;
+uint32_t relayJitterMs = 0;
+
 // OLED display (XIAO Expansion Board: SSD1306 128x64 I2C)
 U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
 uint32_t lastDisplayUpdate = 0;
@@ -211,6 +269,10 @@ uint32_t lastBeaconTime = 0;
 void IRAM_ATTR onReceive() {
     rxFlag = true;
 }
+
+// Forward declarations
+void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
+                          uint8_t payloadLen, float rssi);
 
 void macToStr(const uint8_t* mac, char* buf) {
     snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -337,6 +399,11 @@ bool meshTransmitRaw(MeshPacket& pkt) {
 // Send fragmented message over LoRa mesh
 void meshSendFragmented(const uint8_t* dest, const uint8_t* data, size_t dataLen) {
     uint16_t fragGroupID = nextFragGroupID++;
+    // Skip 0x01xx range — reserved for presence beacon type byte discrimination
+    if ((fragGroupID >> 8) == BEACON_TYPE_PRESENCE) {
+        fragGroupID = 0x0200;
+        nextFragGroupID = 0x0201;
+    }
     uint8_t fragTotal = (dataLen + MAX_FRAG_DATA - 1) / MAX_FRAG_DATA;
     if (fragTotal == 0) fragTotal = 1;
 
@@ -497,8 +564,11 @@ void handleLoRaReceive() {
 
                 bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
 
-                // Reassemble fragments destined for us
-                if (forUs && pkt.payloadLen >= FRAG_HEADER_SIZE) {
+                if (forUs && pkt.payloadLen >= 1 && pkt.payload[0] == BEACON_TYPE_PRESENCE) {
+                    // Presence beacon — update peer table
+                    handlePresenceBeacon(pkt.sender, pkt.payload, pkt.payloadLen, lastRSSI);
+                } else if (forUs && pkt.payloadLen >= FRAG_HEADER_SIZE && pkt.payload[0] != BEACON_TYPE_PRESENCE) {
+                    // Message fragment — reassemble
                     uint16_t fragGroupID = ((uint16_t)pkt.payload[0] << 8) | pkt.payload[1];
                     uint8_t fragIndex = pkt.payload[2];
                     uint8_t fragTotal = pkt.payload[3];
@@ -510,11 +580,23 @@ void handleLoRaReceive() {
                     loraReassemble(pkt.sender, fragGroupID, fragIndex, fragTotal, fragData, fragDataLen);
                 }
 
-                // Relay if not from us and TTL allows
+                // Queue for relay if not from us and TTL allows
+                // (Deferred relay prevents fragment loss — TX during RX drops next fragment)
                 if (!addrMatch(pkt.sender, nodeAddr) && pkt.ttl > 1) {
                     pkt.ttl--;
-                    meshTransmitRaw(pkt);
-                    statRelay++;
+                    // Serialize and queue instead of transmitting inline
+                    bool queued = false;
+                    for (int q = 0; q < (int)RELAY_QUEUE_SIZE; q++) {
+                        if (!relayQueue[q].pending) {
+                            relayQueue[q].len = serializePacket(pkt, relayQueue[q].data);
+                            relayQueue[q].pending = true;
+                            queued = true;
+                            break;
+                        }
+                    }
+                    if (!queued) {
+                        Serial.println("[RELAY] Queue full, dropping packet");
+                    }
                 }
             }
         }
@@ -627,6 +709,163 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
 }
 
 // ============================================================================
+// Phone registration (phone identifies itself to the node)
+// ============================================================================
+
+// Parse: {"type":"register","pigeonID":"a1b2c3d4"} or {"type":"register","pigeonID":"a1b2c3d4","publicKey":"..."}
+void handleBridgeWrite(const uint8_t* data, size_t len) {
+    // Null-terminate for string operations
+    char buf[BLE_MAX_WRITE_SIZE + 1];
+    size_t copyLen = len < BLE_MAX_WRITE_SIZE ? len : BLE_MAX_WRITE_SIZE;
+    memcpy(buf, data, copyLen);
+    buf[copyLen] = '\0';
+
+    // Simple JSON parsing — look for "type":"register" and "pigeonID":"XXXXXXXX"
+    if (strstr(buf, "\"register\"") == nullptr) {
+        Serial.printf("[BRIDGE] Unknown command: %s\n", buf);
+        return;
+    }
+
+    // Extract pigeonID value
+    const char* pidKey = strstr(buf, "\"pigeonID\"");
+    if (!pidKey) {
+        Serial.println("[BRIDGE] Register missing pigeonID");
+        return;
+    }
+    // Find the value after the colon and opening quote
+    const char* p = pidKey + 10; // skip "pigeonID"
+    while (*p && *p != '"') p++;
+    if (!*p) return;
+    p++; // skip opening quote
+    // p now points to the start of the pigeonID value
+    const char* pidStart = p;
+    while (*p && *p != '"') p++;
+    size_t pidLen = p - pidStart;
+    if (pidLen != 8) {
+        Serial.printf("[BRIDGE] Invalid pigeonID length: %d\n", pidLen);
+        return;
+    }
+
+    char pigeonID[9];
+    memcpy(pigeonID, pidStart, 8);
+    pigeonID[8] = '\0';
+
+    // Convert hex pigeonID to 4 bytes
+    uint8_t pidBytes[PIGEON_ID_LEN];
+    for (int i = 0; i < (int)PIGEON_ID_LEN; i++) {
+        char hex[3] = {pigeonID[i*2], pigeonID[i*2+1], '\0'};
+        pidBytes[i] = (uint8_t)strtol(hex, nullptr, 16);
+    }
+
+    // Check if already registered
+    for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+        if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pigeonID) == 0) {
+            Serial.printf("[BRIDGE] Phone %s already registered (slot %d)\n", pigeonID, i);
+            return;
+        }
+    }
+
+    // Find empty slot
+    for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+        if (!registeredPhones[i].active) {
+            memcpy(registeredPhones[i].pigeonID, pigeonID, 9);
+            memcpy(registeredPhones[i].pigeonIDBytes, pidBytes, PIGEON_ID_LEN);
+            registeredPhones[i].connId = lastBLEConnId;
+            registeredPhones[i].active = true;
+            Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d)\n",
+                          pigeonID, i, lastBLEConnId);
+            return;
+        }
+    }
+    Serial.println("[BRIDGE] Registration full, ignoring");
+}
+
+// ============================================================================
+// Presence beacon handling (receive beacons from other nodes)
+// ============================================================================
+
+void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
+                          uint8_t payloadLen, float rssi) {
+    // Payload: [type:1B=0x01][numPhones:1B][pigeonID_1:4B][pigeonID_2:4B]...
+    if (payloadLen < 2) return;
+
+    uint8_t numPhones = payload[1];
+    char senderStr[18];
+    macToStr(sender, senderStr);
+    Serial.printf("[BEACON RX] from=%s phones=%d RSSI=%.1f\n", senderStr, numPhones, rssi);
+    if (numPhones == 0) return;
+
+    size_t expectedLen = 2 + (size_t)numPhones * PIGEON_ID_LEN;
+    if (payloadLen < expectedLen) {
+        Serial.printf("[BEACON] Truncated presence from %s (got %d, need %d)\n",
+                      senderStr, payloadLen, expectedLen);
+        return;
+    }
+
+    uint32_t now = millis();
+    for (uint8_t p = 0; p < numPhones; p++) {
+        const uint8_t* pidBytes = payload + 2 + p * PIGEON_ID_LEN;
+        char pid[9];
+        snprintf(pid, 9, "%02x%02x%02x%02x", pidBytes[0], pidBytes[1], pidBytes[2], pidBytes[3]);
+
+        // Skip our own registered phones
+        bool isOurs = false;
+        for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+            if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pid) == 0) {
+                isOurs = true;
+                break;
+            }
+        }
+        if (isOurs) continue;
+
+        // Update or insert into peer table
+        int slot = -1;
+        int emptySlot = -1;
+        int oldestSlot = 0;
+        uint32_t oldestTime = UINT32_MAX;
+        for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+            if (peerTable[i].active && strcmp(peerTable[i].pigeonID, pid) == 0) {
+                slot = i;
+                break;
+            }
+            if (!peerTable[i].active && emptySlot < 0) emptySlot = i;
+            if (peerTable[i].active && peerTable[i].lastSeen < oldestTime) {
+                oldestTime = peerTable[i].lastSeen;
+                oldestSlot = i;
+            }
+        }
+
+        if (slot < 0) {
+            slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
+            memcpy(peerTable[slot].pigeonID, pid, 9);
+            peerTableChanged = true;
+            Serial.printf("[PEERS] New peer %s via %s RSSI=%.1f\n", pid, senderStr, rssi);
+        }
+        peerTable[slot].lastSeen = now;
+        peerTable[slot].rssi = rssi;
+        peerTable[slot].active = true;
+    }
+}
+
+// Expire old peer entries, returns number of active peers
+uint8_t expirePeers() {
+    uint32_t now = millis();
+    uint8_t count = 0;
+    for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+        if (peerTable[i].active) {
+            if (now - peerTable[i].lastSeen > PEER_EXPIRY_MS) {
+                Serial.printf("[PEERS] Expired peer %s\n", peerTable[i].pigeonID);
+                peerTable[i].active = false;
+                peerTableChanged = true;
+            } else {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+// ============================================================================
 // BLE chunked notification (send to phone)
 // ============================================================================
 
@@ -670,15 +909,27 @@ void bleSendChunked(BLECharacteristic* pChar, const uint8_t* data, size_t dataLe
 // ============================================================================
 
 class ServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) override {
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
         bleClientConnected = true;
-        Serial.printf("[BLE] Client connected (%d total)\n", pServer->getConnectedCount());
-        // Keep advertising so more phones can connect
+        lastBLEConnId = param->connect.conn_id;
+        Serial.printf("[BLE] Client connected (conn_id=%d, %d total)\n",
+                      lastBLEConnId, pServer->getConnectedCount());
         BLEDevice::startAdvertising();
     }
-    void onDisconnect(BLEServer* pServer) override {
-        bleClientConnected = (pServer->getConnectedCount() > 0);
-        Serial.printf("[BLE] Client disconnected (%d remaining)\n", pServer->getConnectedCount());
+    void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
+        uint16_t disconnId = param->disconnect.conn_id;
+        uint16_t remaining = pServer->getConnectedCount();
+        bleClientConnected = (remaining > 0);
+        Serial.printf("[BLE] Client disconnected (conn_id=%d, %d remaining)\n",
+                      disconnId, remaining);
+        // Remove phone registration for this specific connection
+        for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+            if (registeredPhones[i].active && registeredPhones[i].connId == disconnId) {
+                Serial.printf("[BLE] Unregistered phone %s (conn_id=%d disconnected)\n",
+                              registeredPhones[i].pigeonID, disconnId);
+                registeredPhones[i].active = false;
+            }
+        }
         BLEDevice::startAdvertising();
     }
 };
@@ -719,10 +970,17 @@ class AckCharCallbacks : public BLECharacteristicCallbacks {
 
 class BridgeCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pChar) override {
-        // Bridge control — handle chunked data same as messages
         std::string val = pChar->getValue();
-        Serial.printf("[BLE BRIDGE] Received %d bytes\n", val.length());
-        // For now, just log. Bridge control can be extended later.
+        if (val.length() > 0 && bleEventQueue) {
+            BLEEvent evt;
+            evt.type = BLE_EVENT_BRIDGE_WRITE;
+            evt.len = val.length();
+            if (evt.len > BLE_MAX_WRITE_SIZE) evt.len = BLE_MAX_WRITE_SIZE;
+            memcpy(evt.data, val.data(), evt.len);
+            if (xQueueSend(bleEventQueue, &evt, 0) != pdTRUE) {
+                Serial.println("[BLE] Event queue full, dropping bridge write");
+            }
+        }
     }
 };
 
@@ -880,15 +1138,20 @@ void updateDisplay() {
     u8x8.setCursor(0, 1);
     u8x8.print(nodePigeonID);
 
-    // Connected phones
+    // Connected phones and mesh nodes
     u8x8.setCursor(0, 3);
-    snprintf(line, sizeof(line), "Phones: %-8u",
-             (unsigned)(pServer ? pServer->getConnectedCount() : 0));
+    snprintf(line, sizeof(line), "Ph:%-2u Nodes:%-4u",
+             (unsigned)(pServer ? pServer->getConnectedCount() : 0),
+             (unsigned)countMeshNodes());
     u8x8.print(line);
 
-    // Mesh nodes heard in last 30s
+    // Mesh-reachable peers (phones on other nodes)
+    uint8_t peerCount = 0;
+    for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+        if (peerTable[i].active) peerCount++;
+    }
     u8x8.setCursor(0, 4);
-    snprintf(line, sizeof(line), "Nodes:  %-8u", (unsigned)countMeshNodes());
+    snprintf(line, sizeof(line), "Peers:  %-8u", (unsigned)peerCount);
     u8x8.print(line);
 
     // Last received signal strength
@@ -961,6 +1224,9 @@ void setup() {
     memset(bleReasmTable, 0, sizeof(bleReasmTable));
     memset(bleTxQueue, 0, sizeof(bleTxQueue));
     memset(loraRxQueue, 0, sizeof(loraRxQueue));
+    memset(registeredPhones, 0, sizeof(registeredPhones));
+    memset(peerTable, 0, sizeof(peerTable));
+    memset(relayQueue, 0, sizeof(relayQueue));
 
     // Create BLE event queue before starting BLE (callbacks use it)
     bleEventQueue = xQueueCreate(BLE_EVENT_QUEUE_LEN, sizeof(BLEEvent));
@@ -995,6 +1261,8 @@ void loop() {
         } else if (evt.type == BLE_EVENT_ACK_WRITE) {
             Serial.printf("[BLE ACK] Received %d bytes, broadcasting over LoRa\n", evt.len);
             meshSendFragmented(BROADCAST_ADDR, evt.data, evt.len);
+        } else if (evt.type == BLE_EVENT_BRIDGE_WRITE) {
+            handleBridgeWrite(evt.data, evt.len);
         }
     }
 
@@ -1018,7 +1286,7 @@ void loop() {
         }
     }
 
-    // 5. LoRa heartbeat beacon — lets other nodes know we exist
+    // 5. LoRa heartbeat beacon with presence info
     {
         uint32_t now = millis();
         if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
@@ -1028,13 +1296,104 @@ void loop() {
             memcpy(pkt.dest, BROADCAST_ADDR, ADDR_LEN);
             pkt.msgID = nextMsgID++;
             pkt.ttl = 1; // Beacons don't need to propagate far
-            pkt.payloadLen = 0;
+
+            // Build presence payload: [type:0x01][numPhones:1B][pigeonID_1:4B]...
+            uint8_t numPhones = 0;
+            for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+                if (registeredPhones[i].active) numPhones++;
+            }
+            pkt.payload[0] = BEACON_TYPE_PRESENCE;
+            pkt.payload[1] = numPhones;
+            uint8_t pIdx = 0;
+            for (size_t i = 0; i < MAX_REGISTERED_PHONES && pIdx < numPhones; i++) {
+                if (registeredPhones[i].active) {
+                    memcpy(pkt.payload + 2 + pIdx * PIGEON_ID_LEN,
+                           registeredPhones[i].pigeonIDBytes, PIGEON_ID_LEN);
+                    pIdx++;
+                }
+            }
+            pkt.payloadLen = 2 + numPhones * PIGEON_ID_LEN;
+
             addDedup(pkt.sender, pkt.msgID);
             meshTransmitRaw(pkt);
+            Serial.printf("[BEACON] Sent presence (phones=%d)\n", numPhones);
         }
     }
 
-    // 6. BLE advertising watchdog — restart if no client and interval elapsed
+    // 6. Drain relay queue with jitter (deferred relay to avoid fragment loss during RX)
+    // All radio operations happen on this task — no mutex needed (single-threaded loop)
+    {
+        uint32_t now = millis();
+        if (now - lastRelayTime >= relayJitterMs) {
+            for (int i = 0; i < (int)RELAY_QUEUE_SIZE; i++) {
+                if (relayQueue[i].pending) {
+                    int state = radio.transmit(relayQueue[i].data, relayQueue[i].len);
+                    rxFlag = false;
+                    radio.startReceive();
+                    relayQueue[i].pending = false;
+                    lastRelayTime = now;
+                    relayJitterMs = 50 + (esp_random() % 100); // 50-150ms jitter
+                    if (state == RADIOLIB_ERR_NONE) {
+                        statRelay++;
+                    } else {
+                        Serial.printf("[RELAY] TX failed: %d\n", state);
+                    }
+                    // Only relay one packet per drain cycle
+                    break;
+                }
+            }
+        }
+    }
+
+    // 7. Expire stale peers and send BLE peer presence notifications
+    {
+        uint32_t now = millis();
+        static uint32_t lastPeerExpiry = 0;
+        if (now - lastPeerExpiry >= 1000) {
+            lastPeerExpiry = now;
+            expirePeers();
+        }
+
+        bool shouldNotify = peerTableChanged ||
+                            (now - lastPeerNotify >= PEER_NOTIFY_MS);
+
+        if (shouldNotify && bleClientConnected && pBridgeChar) {
+            lastPeerNotify = now;
+            peerTableChanged = false;
+
+            // Build JSON: {"type":"peers","pigeonIDs":["a1b2c3d4","e5f6a7b8"]}
+            // Matches iOS app's expected format
+            char json[512];
+            int pos = snprintf(json, sizeof(json), "{\"type\":\"peers\",\"pigeonIDs\":[");
+            bool first = true;
+            for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+                if (peerTable[i].active) {
+                    // Bounds check: leave room for closing "]}" (2) + comma (1) + entry (~12)
+                    if (pos + 15 >= (int)sizeof(json)) break;
+                    if (!first) pos += snprintf(json + pos, sizeof(json) - pos, ",");
+                    pos += snprintf(json + pos, sizeof(json) - pos,
+                                    "\"%s\"", peerTable[i].pigeonID);
+                    first = false;
+                }
+            }
+            snprintf(json + pos, sizeof(json) - pos, "]}");
+
+            pBridgeChar->setValue(json);
+            pBridgeChar->notify();
+        }
+    }
+
+    // 8. Radio watchdog — ensure receive mode is active
+    {
+        uint32_t now = millis();
+        if (now - lastRadioWatchdog >= RADIO_WATCHDOG_MS) {
+            lastRadioWatchdog = now;
+            // Force restart receive mode as a safety net
+            radio.startReceive();
+        }
+    }
+
+    // 9. BLE advertising watchdog — restart if no client and interval elapsed
     if (!bleClientConnected) {
         uint32_t now = millis();
         if (now - lastBLEAdvRestart >= BLE_ADV_RESTART_MS) {
@@ -1043,7 +1402,7 @@ void loop() {
         }
     }
 
-    // 6. Update OLED display every second
+    // 10. Update OLED display every second
     {
         uint32_t now = millis();
         if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
