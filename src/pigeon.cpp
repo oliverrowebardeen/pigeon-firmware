@@ -238,6 +238,13 @@ RelayItem relayQueue[RELAY_QUEUE_SIZE];
 // Radio watchdog
 uint32_t lastRadioWatchdog = 0;
 
+// Track the most recent BLE connection ID for associating with phone registration
+uint16_t lastBLEConnId = 0;
+
+// Relay jitter (random delay to reduce collision between relay nodes)
+uint32_t lastRelayTime = 0;
+uint32_t relayJitterMs = 0;
+
 // OLED display (XIAO Expansion Board: SSD1306 128x64 I2C)
 U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
 uint32_t lastDisplayUpdate = 0;
@@ -578,12 +585,17 @@ void handleLoRaReceive() {
                 if (!addrMatch(pkt.sender, nodeAddr) && pkt.ttl > 1) {
                     pkt.ttl--;
                     // Serialize and queue instead of transmitting inline
+                    bool queued = false;
                     for (int q = 0; q < (int)RELAY_QUEUE_SIZE; q++) {
                         if (!relayQueue[q].pending) {
                             relayQueue[q].len = serializePacket(pkt, relayQueue[q].data);
                             relayQueue[q].pending = true;
+                            queued = true;
                             break;
                         }
+                    }
+                    if (!queued) {
+                        Serial.println("[RELAY] Queue full, dropping packet");
                     }
                 }
             }
@@ -758,8 +770,10 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
         if (!registeredPhones[i].active) {
             memcpy(registeredPhones[i].pigeonID, pigeonID, 9);
             memcpy(registeredPhones[i].pigeonIDBytes, pidBytes, PIGEON_ID_LEN);
+            registeredPhones[i].connId = lastBLEConnId;
             registeredPhones[i].active = true;
-            Serial.printf("[BRIDGE] Registered phone %s (slot %d)\n", pigeonID, i);
+            Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d)\n",
+                          pigeonID, i, lastBLEConnId);
             return;
         }
     }
@@ -895,23 +909,25 @@ void bleSendChunked(BLECharacteristic* pChar, const uint8_t* data, size_t dataLe
 // ============================================================================
 
 class ServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) override {
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
         bleClientConnected = true;
-        Serial.printf("[BLE] Client connected (%d total)\n", pServer->getConnectedCount());
+        lastBLEConnId = param->connect.conn_id;
+        Serial.printf("[BLE] Client connected (conn_id=%d, %d total)\n",
+                      lastBLEConnId, pServer->getConnectedCount());
         BLEDevice::startAdvertising();
     }
-    void onDisconnect(BLEServer* pServer) override {
+    void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
+        uint16_t disconnId = param->disconnect.conn_id;
         uint16_t remaining = pServer->getConnectedCount();
         bleClientConnected = (remaining > 0);
-        Serial.printf("[BLE] Client disconnected (%d remaining)\n", remaining);
-        // Clear all phone registrations when no clients remain
-        if (remaining == 0) {
-            for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
-                if (registeredPhones[i].active) {
-                    Serial.printf("[BLE] Unregistered phone %s (all clients disconnected)\n",
-                                  registeredPhones[i].pigeonID);
-                    registeredPhones[i].active = false;
-                }
+        Serial.printf("[BLE] Client disconnected (conn_id=%d, %d remaining)\n",
+                      disconnId, remaining);
+        // Remove phone registration for this specific connection
+        for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+            if (registeredPhones[i].active && registeredPhones[i].connId == disconnId) {
+                Serial.printf("[BLE] Unregistered phone %s (conn_id=%d disconnected)\n",
+                              registeredPhones[i].pigeonID, disconnId);
+                registeredPhones[i].active = false;
             }
         }
         BLEDevice::startAdvertising();
@@ -1307,25 +1323,39 @@ void loop() {
         }
     }
 
-    // 6. Drain relay queue (deferred relay to avoid fragment loss during RX)
-    for (int i = 0; i < (int)RELAY_QUEUE_SIZE; i++) {
-        if (relayQueue[i].pending) {
-            int state = radio.transmit(relayQueue[i].data, relayQueue[i].len);
-            rxFlag = false;
-            radio.startReceive();
-            relayQueue[i].pending = false;
-            if (state == RADIOLIB_ERR_NONE) {
-                statRelay++;
+    // 6. Drain relay queue with jitter (deferred relay to avoid fragment loss during RX)
+    // All radio operations happen on this task — no mutex needed (single-threaded loop)
+    {
+        uint32_t now = millis();
+        if (now - lastRelayTime >= relayJitterMs) {
+            for (int i = 0; i < (int)RELAY_QUEUE_SIZE; i++) {
+                if (relayQueue[i].pending) {
+                    int state = radio.transmit(relayQueue[i].data, relayQueue[i].len);
+                    rxFlag = false;
+                    radio.startReceive();
+                    relayQueue[i].pending = false;
+                    lastRelayTime = now;
+                    relayJitterMs = 50 + (esp_random() % 100); // 50-150ms jitter
+                    if (state == RADIOLIB_ERR_NONE) {
+                        statRelay++;
+                    } else {
+                        Serial.printf("[RELAY] TX failed: %d\n", state);
+                    }
+                    // Only relay one packet per drain cycle
+                    break;
+                }
             }
-            // Only relay one packet per loop iteration to allow RX between relays
-            break;
         }
     }
 
     // 7. Expire stale peers and send BLE peer presence notifications
     {
         uint32_t now = millis();
-        expirePeers();
+        static uint32_t lastPeerExpiry = 0;
+        if (now - lastPeerExpiry >= 1000) {
+            lastPeerExpiry = now;
+            expirePeers();
+        }
 
         bool shouldNotify = peerTableChanged ||
                             (now - lastPeerNotify >= PEER_NOTIFY_MS);
@@ -1335,11 +1365,14 @@ void loop() {
             peerTableChanged = false;
 
             // Build JSON: {"type":"peers","peers":[{"pigeonID":"...","rssi":-85},...]}
-            char json[512];
+            // Worst case: 16 peers × ~37 chars + envelope ≈ 620 bytes
+            char json[768];
             int pos = snprintf(json, sizeof(json), "{\"type\":\"peers\",\"peers\":[");
             bool first = true;
             for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
                 if (peerTable[i].active) {
+                    // Bounds check: leave room for closing "]}" (2) + comma (1) + entry (~40)
+                    if (pos + 45 >= (int)sizeof(json)) break;
                     if (!first) pos += snprintf(json + pos, sizeof(json) - pos, ",");
                     pos += snprintf(json + pos, sizeof(json) - pos,
                                     "{\"pigeonID\":\"%s\",\"rssi\":%d}",
