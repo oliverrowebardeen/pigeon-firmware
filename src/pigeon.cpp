@@ -20,6 +20,7 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
 #include <esp_bt.h>
+#include <U8x8lib.h>
 
 // ============================================================================
 // Configuration
@@ -185,6 +186,23 @@ LoRaRxItem loraRxQueue[LORA_RX_QUEUE_SIZE];
 // BLE event queue and advertising watchdog
 static QueueHandle_t bleEventQueue = nullptr;
 uint32_t lastBLEAdvRestart = 0;
+
+// OLED display (XIAO Expansion Board: SSD1306 128x64 I2C)
+U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(U8X8_PIN_NONE);
+uint32_t lastDisplayUpdate = 0;
+static const uint32_t DISPLAY_UPDATE_MS = 1000;
+
+// Activity counters for display
+uint32_t statLoRaRx = 0;
+uint32_t statRelay = 0;
+uint32_t statBleIn = 0;
+uint32_t statBleOut = 0;
+float lastRSSI = 0;
+bool hasRSSI = false;
+
+// LoRa heartbeat beacon
+static const uint32_t BEACON_INTERVAL_MS = 30000;
+uint32_t lastBeaconTime = 0;
 
 // ============================================================================
 // Utility functions
@@ -464,6 +482,8 @@ void handleLoRaReceive() {
     int state = radio.readData(buf, MAX_LORA_PACKET);
 
     if (state == RADIOLIB_ERR_NONE) {
+        lastRSSI = radio.getRSSI();
+        hasRSSI = true;
         size_t len = radio.getPacketLength();
         MeshPacket pkt;
 
@@ -473,6 +493,7 @@ void handleLoRaReceive() {
 
             if (!isDuplicate(pkt.sender, pkt.msgID)) {
                 addDedup(pkt.sender, pkt.msgID);
+                statLoRaRx++;
 
                 bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
 
@@ -493,6 +514,7 @@ void handleLoRaReceive() {
                 if (!addrMatch(pkt.sender, nodeAddr) && pkt.ttl > 1) {
                     pkt.ttl--;
                     meshTransmitRaw(pkt);
+                    statRelay++;
                 }
             }
         }
@@ -650,11 +672,13 @@ void bleSendChunked(BLECharacteristic* pChar, const uint8_t* data, size_t dataLe
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         bleClientConnected = true;
-        Serial.println("[BLE] Client connected");
+        Serial.printf("[BLE] Client connected (%d total)\n", pServer->getConnectedCount());
+        // Keep advertising so more phones can connect
+        BLEDevice::startAdvertising();
     }
     void onDisconnect(BLEServer* pServer) override {
-        bleClientConnected = false;
-        Serial.println("[BLE] Client disconnected, restarting advertising");
+        bleClientConnected = (pServer->getConnectedCount() > 0);
+        Serial.printf("[BLE] Client disconnected (%d remaining)\n", pServer->getConnectedCount());
         BLEDevice::startAdvertising();
     }
 };
@@ -821,12 +845,96 @@ void setupLoRa() {
 }
 
 // ============================================================================
+// OLED display
+// ============================================================================
+
+// Count unique mesh nodes heard recently (from dedup table)
+uint8_t countMeshNodes() {
+    uint32_t now = millis();
+    uint8_t addrs[16][ADDR_LEN];
+    uint8_t count = 0;
+
+    for (size_t i = 0; i < DEDUP_TABLE_SIZE && count < 16; i++) {
+        if (!dedupTable[i].active) continue;
+        if (now - dedupTable[i].timestamp > DEDUP_EXPIRY_MS) continue;
+        if (addrMatch(dedupTable[i].sender, nodeAddr)) continue;
+
+        bool seen = false;
+        for (uint8_t j = 0; j < count; j++) {
+            if (addrMatch(addrs[j], dedupTable[i].sender)) { seen = true; break; }
+        }
+        if (!seen) {
+            memcpy(addrs[count], dedupTable[i].sender, ADDR_LEN);
+            count++;
+        }
+    }
+    return count;
+}
+
+void updateDisplay() {
+    char line[17];
+
+    u8x8.setCursor(0, 0);
+    u8x8.print("PIGEON");
+
+    u8x8.setCursor(0, 1);
+    u8x8.print(nodePigeonID);
+
+    // Connected phones
+    u8x8.setCursor(0, 3);
+    snprintf(line, sizeof(line), "Phones: %-8u",
+             (unsigned)(pServer ? pServer->getConnectedCount() : 0));
+    u8x8.print(line);
+
+    // Mesh nodes heard in last 30s
+    u8x8.setCursor(0, 4);
+    snprintf(line, sizeof(line), "Nodes:  %-8u", (unsigned)countMeshNodes());
+    u8x8.print(line);
+
+    // Last received signal strength
+    u8x8.setCursor(0, 5);
+    if (hasRSSI) {
+        char rssi[11];
+        snprintf(rssi, sizeof(rssi), "%d dBm", (int)lastRSSI);
+        snprintf(line, sizeof(line), "RSSI: %-10s", rssi);
+    } else {
+        snprintf(line, sizeof(line), "RSSI: %-10s", "--");
+    }
+    u8x8.print(line);
+
+    // LoRa packet stats
+    u8x8.setCursor(0, 6);
+    snprintf(line, sizeof(line), "Rx:%-4lu Fw:%-4lu",
+             (unsigned long)statLoRaRx, (unsigned long)statRelay);
+    u8x8.print(line);
+
+    // Uptime
+    uint32_t sec = millis() / 1000;
+    u8x8.setCursor(0, 7);
+    snprintf(line, sizeof(line), "Up %luh %02lum %02lus",
+             (unsigned long)(sec / 3600),
+             (unsigned long)((sec % 3600) / 60),
+             (unsigned long)(sec % 60));
+    u8x8.print(line);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 void setup() {
     Serial.begin(115200);
     delay(2000);
+
+    // Initialize OLED display
+    u8x8.begin();
+    u8x8.setFlipMode(1); // Expansion board mounts display upside-down
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.clear();
+    u8x8.setCursor(0, 0);
+    u8x8.print("PIGEON");
+    u8x8.setCursor(0, 2);
+    u8x8.print("Booting...");
 
     esp_efuse_mac_get_default(nodeAddr);
     loadOrGenerateKey();
@@ -860,9 +968,16 @@ void setup() {
     setupLoRa();
     setupBLE();
 
+    // Offset beacon timing so nodes don't all beacon at the same instant
+    lastBeaconTime = millis() - BEACON_INTERVAL_MS + (nodeAddr[5] * 37 % BEACON_INTERVAL_MS);
+
     Serial.println();
     Serial.println("[PIGEON] Node ready. BLE + LoRa mesh active.");
     Serial.println();
+
+    // Show initial status on display
+    u8x8.clear();
+    updateDisplay();
 }
 
 void loop() {
@@ -889,6 +1004,7 @@ void loop() {
             Serial.printf("[MESH] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
             meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
             bleTxQueue[i].pending = false;
+            statBleIn++;
         }
     }
 
@@ -898,15 +1014,41 @@ void loop() {
             Serial.printf("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
             bleSendChunked(pMsgChar, loraRxQueue[i].data, loraRxQueue[i].len);
             loraRxQueue[i].pending = false;
+            statBleOut++;
         }
     }
 
-    // 5. BLE advertising watchdog — restart if no client and interval elapsed
+    // 5. LoRa heartbeat beacon — lets other nodes know we exist
+    {
+        uint32_t now = millis();
+        if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
+            lastBeaconTime = now;
+            MeshPacket pkt;
+            memcpy(pkt.sender, nodeAddr, ADDR_LEN);
+            memcpy(pkt.dest, BROADCAST_ADDR, ADDR_LEN);
+            pkt.msgID = nextMsgID++;
+            pkt.ttl = 1; // Beacons don't need to propagate far
+            pkt.payloadLen = 0;
+            addDedup(pkt.sender, pkt.msgID);
+            meshTransmitRaw(pkt);
+        }
+    }
+
+    // 6. BLE advertising watchdog — restart if no client and interval elapsed
     if (!bleClientConnected) {
         uint32_t now = millis();
         if (now - lastBLEAdvRestart >= BLE_ADV_RESTART_MS) {
             lastBLEAdvRestart = now;
             BLEDevice::startAdvertising();
+        }
+    }
+
+    // 6. Update OLED display every second
+    {
+        uint32_t now = millis();
+        if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
+            lastDisplayUpdate = now;
+            updateDisplay();
         }
     }
 
