@@ -790,10 +790,10 @@ void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
     if (payloadLen < 2) return;
 
     uint8_t numPhones = payload[1];
-    if (numPhones == 0) return;
-
     char senderStr[18];
     macToStr(sender, senderStr);
+    Serial.printf("[BEACON RX] from=%s phones=%d RSSI=%.1f\n", senderStr, numPhones, rssi);
+    if (numPhones == 0) return;
 
     size_t expectedLen = 2 + (size_t)numPhones * PIGEON_ID_LEN;
     if (payloadLen < expectedLen) {
@@ -1316,10 +1316,7 @@ void loop() {
 
             addDedup(pkt.sender, pkt.msgID);
             meshTransmitRaw(pkt);
-
-            if (numPhones > 0) {
-                Serial.printf("[BEACON] Sent presence with %d phone(s)\n", numPhones);
-            }
+            Serial.printf("[BEACON] Sent presence (phones=%d)\n", numPhones);
         }
     }
 
