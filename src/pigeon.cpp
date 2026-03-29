@@ -98,7 +98,10 @@ static const size_t PIGEON_ID_LEN         = 4;   // 4 bytes = 8 hex chars
 static const size_t PEER_TABLE_SIZE       = 16;
 static const uint32_t PEER_EXPIRY_MS      = 90000; // 3× beacon interval
 static const uint32_t PEER_NOTIFY_MS      = 10000; // BLE notification interval
-static const uint8_t BEACON_TYPE_PRESENCE = 0x01;  // Distinguishes beacons from fragments
+static const uint8_t BEACON_TYPE_PRESENCE    = 0x01;  // Legacy: 4-byte pigeonIDs
+static const uint8_t BEACON_TYPE_PRESENCE_V2 = 0x02;  // V2: 32-byte public keys
+static const size_t  PUBKEY_LEN              = 32;
+static const size_t  MAX_BEACON_PEERS        = 7;     // floor((234 - 2) / 32)
 
 // --- Relay queue (deferred relay to avoid fragment loss) ---
 static const size_t RELAY_QUEUE_SIZE      = 8;
@@ -121,16 +124,29 @@ struct BLEEvent {
 struct RegisteredPhone {
     char pigeonID[9];       // 8 hex chars + null
     uint8_t pigeonIDBytes[PIGEON_ID_LEN]; // Binary form for beacon payload
+    uint8_t publicKey[PUBKEY_LEN];        // Full Curve25519 public key
+    bool hasPublicKey;
     uint16_t connId;        // BLE connection ID to track disconnects
     bool active;
 };
 
 struct PeerEntry {
     char pigeonID[9];       // 8 hex chars + null
+    uint8_t publicKey[PUBKEY_LEN]; // Full Curve25519 public key
+    bool hasPublicKey;
     uint32_t lastSeen;      // millis() timestamp
     float rssi;             // Signal strength from beacon
     bool active;
 };
+
+// --- Mesh node presence (nodes discovered via LoRa beacons) ---
+static const size_t NODE_TABLE_SIZE = 8;
+struct NodeEntry {
+    uint8_t addr[ADDR_LEN]; // LoRa MAC address
+    uint32_t lastSeen;
+    bool active;
+};
+
 
 struct RelayItem {
     uint8_t data[MAX_LORA_PACKET];
@@ -238,6 +254,9 @@ RegisteredPhone registeredPhones[MAX_REGISTERED_PHONES];
 PeerEntry peerTable[PEER_TABLE_SIZE];
 uint32_t lastPeerNotify = 0;
 bool peerTableChanged = false;
+
+// Node table (mesh nodes heard via LoRa beacons)
+NodeEntry nodeTable[NODE_TABLE_SIZE];
 
 // Relay queue (deferred relay to prevent fragment loss)
 RelayItem relayQueue[RELAY_QUEUE_SIZE];
@@ -639,10 +658,12 @@ void handleLoRaReceive() {
 
                 bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
 
-                if (forUs && pkt.payloadLen >= 1 && pkt.payload[0] == BEACON_TYPE_PRESENCE) {
+                bool isBeacon = (pkt.payload[0] == BEACON_TYPE_PRESENCE ||
+                                pkt.payload[0] == BEACON_TYPE_PRESENCE_V2);
+                if (forUs && pkt.payloadLen >= 1 && isBeacon) {
                     // Presence beacon — update peer table
                     handlePresenceBeacon(pkt.sender, pkt.payload, pkt.payloadLen, lastRSSI);
-                } else if (forUs && pkt.payloadLen >= FRAG_HEADER_SIZE && pkt.payload[0] != BEACON_TYPE_PRESENCE) {
+                } else if (forUs && pkt.payloadLen >= FRAG_HEADER_SIZE && !isBeacon) {
                     // Message fragment — reassemble
                     uint16_t fragGroupID = ((uint16_t)pkt.payload[0] << 8) | pkt.payload[1];
                     uint8_t fragIndex = pkt.payload[2];
@@ -650,9 +671,14 @@ void handleLoRaReceive() {
                     const uint8_t* fragData = pkt.payload + FRAG_HEADER_SIZE;
                     size_t fragDataLen = pkt.payloadLen - FRAG_HEADER_SIZE;
 
-                    Serial.printf("[LORA RX] from=%s frag=%d/%d fragGroup=%04X\n",
-                                  senderStr, fragIndex + 1, fragTotal, fragGroupID);
-                    loraReassemble(pkt.sender, fragGroupID, fragIndex, fragTotal, fragData, fragDataLen);
+                    if (fragTotal == 0 || fragTotal > 16) {
+                        Serial.printf("[LORA RX] Invalid fragTotal=%d from %s, dropping\n",
+                                      fragTotal, senderStr);
+                    } else {
+                        Serial.printf("[LORA RX] from=%s frag=%d/%d fragGroup=%04X\n",
+                                      senderStr, fragIndex + 1, fragTotal, fragGroupID);
+                        loraReassemble(pkt.sender, fragGroupID, fragIndex, fragTotal, fragData, fragDataLen);
+                    }
                 }
 
                 // Queue for relay if not from us and TTL allows
@@ -670,7 +696,10 @@ void handleLoRaReceive() {
                         }
                     }
                     if (!queued) {
-                        Serial.println("[RELAY] Queue full, dropping packet");
+                        static uint32_t relayDrops = 0;
+                        relayDrops++;
+                        Serial.printf("[RELAY] Queue full, dropping packet (total drops: %lu)\n",
+                                      (unsigned long)relayDrops);
                     }
                 }
             }
@@ -765,6 +794,7 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
             totalLen += slot.chunkSizes[i];
         }
 
+        bool queued = false;
         for (int q = 0; q < (int)BLE_TX_QUEUE_SIZE; q++) {
             if (!bleTxQueue[q].pending) {
                 size_t pos = 0;
@@ -775,9 +805,15 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
                 }
                 bleTxQueue[q].len = totalLen;
                 bleTxQueue[q].pending = true;
+                queued = true;
                 Serial.printf("[BLE RX] Complete message reassembled: %d bytes -> LoRa TX queue\n", totalLen);
                 break;
             }
+        }
+        if (!queued) {
+            // Keep slot active so next loop iteration can retry when a TX slot frees up
+            Serial.printf("[BLE RX] TX queue full, deferring %d byte message (will retry)\n", totalLen);
+            return;
         }
         slot.active = false;
     }
@@ -845,15 +881,34 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
             }
         }
 
+        // Decode optional publicKey (base64-encoded 32-byte Curve25519 key)
+        uint8_t phonePubKey[PUBKEY_LEN];
+        bool hasPubKey = false;
+        const char* pubKeyB64 = doc["publicKey"];
+        if (pubKeyB64 && strlen(pubKeyB64) > 0) {
+            size_t decoded = 0;
+            int ret = mbedtls_base64_decode(phonePubKey, PUBKEY_LEN, &decoded,
+                                            (const unsigned char*)pubKeyB64, strlen(pubKeyB64));
+            if (ret == 0 && decoded == PUBKEY_LEN) {
+                hasPubKey = true;
+                Serial.printf("[BRIDGE] Phone %s provided public key\n", pigeonID);
+            } else {
+                Serial.printf("[BRIDGE] Phone %s publicKey decode failed (ret=%d, len=%d)\n",
+                              pigeonID, ret, (int)decoded);
+            }
+        }
+
         // Find empty slot
         for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
             if (!registeredPhones[i].active) {
                 strncpy(registeredPhones[i].pigeonID, pigeonID, 9);
                 memcpy(registeredPhones[i].pigeonIDBytes, pidBytes, PIGEON_ID_LEN);
                 registeredPhones[i].connId = lastBLEConnId;
+                registeredPhones[i].hasPublicKey = hasPubKey;
+                if (hasPubKey) memcpy(registeredPhones[i].publicKey, phonePubKey, PUBKEY_LEN);
                 registeredPhones[i].active = true;
-                Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d)\n",
-                              pigeonID, i, lastBLEConnId);
+                Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d, hasKey=%d)\n",
+                              pigeonID, i, lastBLEConnId, hasPubKey);
                 return;
             }
         }
@@ -868,66 +923,115 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
 // Presence beacon handling (receive beacons from other nodes)
 // ============================================================================
 
-void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
-                          uint8_t payloadLen, float rssi) {
-    // Payload: [type:1B=0x01][numPhones:1B][pigeonID_1:4B][pigeonID_2:4B]...
-    if (payloadLen < 2) return;
+// Compute pigeonID (8 hex chars) from a 32-byte public key
+void pigeonIDFromPubKey(const uint8_t* pubKey, char* pidOut, uint8_t* pidBytesOut) {
+    uint8_t hash[32];
+    mbedtls_sha256(pubKey, PUBKEY_LEN, hash, 0);
+    snprintf(pidOut, 9, "%02x%02x%02x%02x", hash[0], hash[1], hash[2], hash[3]);
+    if (pidBytesOut) memcpy(pidBytesOut, hash, PIGEON_ID_LEN);
+}
 
-    uint8_t numPhones = payload[1];
-    char senderStr[18];
-    macToStr(sender, senderStr);
-    Serial.printf("[BEACON RX] from=%s phones=%d RSSI=%.1f\n", senderStr, numPhones, rssi);
-    if (numPhones == 0) return;
+// Update or insert a peer into the peer table
+void upsertPeer(const char* pid, const uint8_t* pubKey, bool hasPubKey,
+                float rssi, const char* via) {
+    uint32_t now = millis();
 
-    size_t expectedLen = 2 + (size_t)numPhones * PIGEON_ID_LEN;
-    if (payloadLen < expectedLen) {
-        Serial.printf("[BEACON] Truncated presence from %s (got %d, need %d)\n",
-                      senderStr, payloadLen, expectedLen);
-        return;
+    // Skip our own registered phones
+    for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+        if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pid) == 0) {
+            return;
+        }
     }
 
-    uint32_t now = millis();
-    for (uint8_t p = 0; p < numPhones; p++) {
-        const uint8_t* pidBytes = payload + 2 + p * PIGEON_ID_LEN;
-        char pid[9];
-        snprintf(pid, 9, "%02x%02x%02x%02x", pidBytes[0], pidBytes[1], pidBytes[2], pidBytes[3]);
-
-        // Skip our own registered phones
-        bool isOurs = false;
-        for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
-            if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pid) == 0) {
-                isOurs = true;
-                break;
-            }
+    int slot = -1, emptySlot = -1, oldestSlot = 0;
+    uint32_t oldestTime = UINT32_MAX;
+    for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+        if (peerTable[i].active && strcmp(peerTable[i].pigeonID, pid) == 0) {
+            slot = i;
+            break;
         }
-        if (isOurs) continue;
-
-        // Update or insert into peer table
-        int slot = -1;
-        int emptySlot = -1;
-        int oldestSlot = 0;
-        uint32_t oldestTime = UINT32_MAX;
-        for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
-            if (peerTable[i].active && strcmp(peerTable[i].pigeonID, pid) == 0) {
-                slot = i;
-                break;
-            }
-            if (!peerTable[i].active && emptySlot < 0) emptySlot = i;
-            if (peerTable[i].active && peerTable[i].lastSeen < oldestTime) {
-                oldestTime = peerTable[i].lastSeen;
-                oldestSlot = i;
-            }
+        if (!peerTable[i].active && emptySlot < 0) emptySlot = i;
+        if (peerTable[i].active && peerTable[i].lastSeen < oldestTime) {
+            oldestTime = peerTable[i].lastSeen;
+            oldestSlot = i;
         }
+    }
 
-        if (slot < 0) {
-            slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
-            memcpy(peerTable[slot].pigeonID, pid, 9);
-            peerTableChanged = true;
-            Serial.printf("[PEERS] New peer %s via %s RSSI=%.1f\n", pid, senderStr, rssi);
+    if (slot < 0) {
+        slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
+        memcpy(peerTable[slot].pigeonID, pid, 9);
+        peerTableChanged = true;
+        Serial.printf("[PEERS] New peer %s via %s RSSI=%.1f\n", pid, via, rssi);
+    }
+
+    // Upgrade: if we didn't have pubkey but now do, update it
+    if (hasPubKey && (!peerTable[slot].hasPublicKey || !peerTable[slot].active)) {
+        memcpy(peerTable[slot].publicKey, pubKey, PUBKEY_LEN);
+        peerTable[slot].hasPublicKey = true;
+        peerTableChanged = true;
+    }
+
+    peerTable[slot].lastSeen = now;
+    peerTable[slot].rssi = rssi;
+    peerTable[slot].active = true;
+}
+
+void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
+                          uint8_t payloadLen, float rssi) {
+    if (payloadLen < 2) return;
+
+    uint8_t beaconType = payload[0];
+    uint8_t numPeers = payload[1];
+    char senderStr[18];
+    macToStr(sender, senderStr);
+    Serial.printf("[BEACON RX] from=%s type=0x%02X peers=%d RSSI=%.1f\n",
+                  senderStr, beaconType, numPeers, rssi);
+
+    // Track the sending node regardless of peer count
+    {
+        uint32_t now = millis();
+        int slot = -1, emptySlot = -1;
+        for (int i = 0; i < (int)NODE_TABLE_SIZE; i++) {
+            if (nodeTable[i].active && addrMatch(nodeTable[i].addr, sender)) { slot = i; break; }
+            if (!nodeTable[i].active && emptySlot < 0) emptySlot = i;
         }
-        peerTable[slot].lastSeen = now;
-        peerTable[slot].rssi = rssi;
-        peerTable[slot].active = true;
+        if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : 0;
+        memcpy(nodeTable[slot].addr, sender, ADDR_LEN);
+        nodeTable[slot].lastSeen = now;
+        nodeTable[slot].active = true;
+    }
+
+    if (numPeers == 0) return;
+
+    if (beaconType == BEACON_TYPE_PRESENCE_V2) {
+        // V2: [0x02][numPeers][pubKey_1:32B][pubKey_2:32B]...
+        size_t expectedLen = 2 + (size_t)numPeers * PUBKEY_LEN;
+        if (payloadLen < expectedLen) {
+            Serial.printf("[BEACON] Truncated v2 from %s (got %d, need %d)\n",
+                          senderStr, payloadLen, (int)expectedLen);
+            return;
+        }
+        for (uint8_t p = 0; p < numPeers; p++) {
+            const uint8_t* pubKey = payload + 2 + p * PUBKEY_LEN;
+            char pid[9];
+            pigeonIDFromPubKey(pubKey, pid, nullptr);
+            upsertPeer(pid, pubKey, true, rssi, senderStr);
+        }
+    } else {
+        // V1 legacy: [0x01][numPhones][pigeonID_1:4B][pigeonID_2:4B]...
+        size_t expectedLen = 2 + (size_t)numPeers * PIGEON_ID_LEN;
+        if (payloadLen < expectedLen) {
+            Serial.printf("[BEACON] Truncated v1 from %s (got %d, need %d)\n",
+                          senderStr, payloadLen, (int)expectedLen);
+            return;
+        }
+        for (uint8_t p = 0; p < numPeers; p++) {
+            const uint8_t* pidBytes = payload + 2 + p * PIGEON_ID_LEN;
+            char pid[9];
+            snprintf(pid, 9, "%02x%02x%02x%02x",
+                     pidBytes[0], pidBytes[1], pidBytes[2], pidBytes[3]);
+            upsertPeer(pid, nullptr, false, rssi, senderStr);
+        }
     }
 }
 
@@ -1427,7 +1531,8 @@ void handleMsgDeliver(JsonDocument& doc) {
     Serial.printf("[BRIDGE] Relay->LoRa: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
 
     meshSendFragmented(BROADCAST_ADDR, fullMsg, fullLen);
-    bleSendChunked(pMsgChar, fullMsg, fullLen);
+    // Strip routing header for BLE delivery — phone expects raw envelope JSON
+    bleSendChunked(pMsgChar, fullMsg + ROUTING_HEADER_SIZE, envelopeLen);
 
     free(fullMsg);
 
@@ -1707,24 +1812,17 @@ void setupLoRa() {
 // OLED display
 // ============================================================================
 
-// Count unique mesh nodes heard recently (from dedup table)
+// Count active mesh nodes (from node table, 90s expiry matches PEER_EXPIRY_MS)
 uint8_t countMeshNodes() {
     uint32_t now = millis();
-    uint8_t addrs[16][ADDR_LEN];
     uint8_t count = 0;
-
-    for (size_t i = 0; i < DEDUP_TABLE_SIZE && count < 16; i++) {
-        if (!dedupTable[i].active) continue;
-        if (now - dedupTable[i].timestamp > DEDUP_EXPIRY_MS) continue;
-        if (addrMatch(dedupTable[i].sender, nodeAddr)) continue;
-
-        bool seen = false;
-        for (uint8_t j = 0; j < count; j++) {
-            if (addrMatch(addrs[j], dedupTable[i].sender)) { seen = true; break; }
-        }
-        if (!seen) {
-            memcpy(addrs[count], dedupTable[i].sender, ADDR_LEN);
-            count++;
+    for (size_t i = 0; i < NODE_TABLE_SIZE; i++) {
+        if (nodeTable[i].active) {
+            if (now - nodeTable[i].lastSeen > PEER_EXPIRY_MS) {
+                nodeTable[i].active = false;
+            } else {
+                count++;
+            }
         }
     }
     return count;
@@ -1831,6 +1929,7 @@ void setup() {
     memset(loraRxQueue, 0, sizeof(loraRxQueue));
     memset(registeredPhones, 0, sizeof(registeredPhones));
     memset(peerTable, 0, sizeof(peerTable));
+    memset(nodeTable, 0, sizeof(nodeTable));
     memset(relayQueue, 0, sizeof(relayQueue));
     memset(msgDedupTable, 0, sizeof(msgDedupTable));
 
@@ -1890,15 +1989,28 @@ void loop() {
     for (int i = 0; i < (int)LORA_RX_QUEUE_SIZE; i++) {
         if (loraRxQueue[i].pending) {
             Serial.printf("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
-            bleSendChunked(pMsgChar, loraRxQueue[i].data, loraRxQueue[i].len);
+            // Bridge to relay server using full data (with routing header)
             bridgeToRelay(loraRxQueue[i].data, loraRxQueue[i].len);
+            // Strip routing header before BLE delivery — phone expects raw envelope JSON.
+            // All messages through the mesh have a routing header prepended by the sender.
+            // Detect by checking if data after the header starts with '{' (valid JSON envelope).
+            const uint8_t* bleData = loraRxQueue[i].data;
+            size_t bleLen = loraRxQueue[i].len;
+            if (bleLen > ROUTING_HEADER_SIZE &&
+                bleData[ROUTING_HEADER_SIZE] == '{') {
+                bleData += ROUTING_HEADER_SIZE;
+                bleLen -= ROUTING_HEADER_SIZE;
+            }
+            bleSendChunked(pMsgChar, bleData, bleLen);
             loraRxQueue[i].pending = false;
             statBleOut++;
         }
     }
 
-    // 5. LoRa heartbeat beacon with presence info
+    // 5. LoRa heartbeat beacon with presence info (gossip: local + remote peers)
     {
+        static uint8_t beaconRoundRobin = 0; // For round-robin when > MAX_BEACON_PEERS
+
         uint32_t now = millis();
         if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
             lastBeaconTime = now;
@@ -1906,28 +2018,60 @@ void loop() {
             memcpy(pkt.sender, nodeAddr, ADDR_LEN);
             memcpy(pkt.dest, BROADCAST_ADDR, ADDR_LEN);
             pkt.msgID = nextMsgID++;
-            pkt.ttl = 1; // Beacons don't need to propagate far
+            pkt.ttl = 1; // Each node re-beacons its full knowledge (gossip)
 
-            // Build presence payload: [type:0x01][numPhones:1B][pigeonID_1:4B]...
-            uint8_t numPhones = 0;
+            // Collect all known public keys: registered phones + peer table
+            // Use a temp array to gather keys, then pick up to MAX_BEACON_PEERS
+            struct PubKeyEntry { uint8_t key[PUBKEY_LEN]; };
+            PubKeyEntry allKeys[MAX_REGISTERED_PHONES + PEER_TABLE_SIZE];
+            uint8_t totalKeys = 0;
+
+            // Local registered phones with public keys
             for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
-                if (registeredPhones[i].active) numPhones++;
-            }
-            pkt.payload[0] = BEACON_TYPE_PRESENCE;
-            pkt.payload[1] = numPhones;
-            uint8_t pIdx = 0;
-            for (size_t i = 0; i < MAX_REGISTERED_PHONES && pIdx < numPhones; i++) {
-                if (registeredPhones[i].active) {
-                    memcpy(pkt.payload + 2 + pIdx * PIGEON_ID_LEN,
-                           registeredPhones[i].pigeonIDBytes, PIGEON_ID_LEN);
-                    pIdx++;
+                if (registeredPhones[i].active && registeredPhones[i].hasPublicKey) {
+                    memcpy(allKeys[totalKeys].key, registeredPhones[i].publicKey, PUBKEY_LEN);
+                    totalKeys++;
                 }
             }
-            pkt.payloadLen = 2 + numPhones * PIGEON_ID_LEN;
+
+            // Remote peers with public keys (gossip)
+            for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+                if (peerTable[i].active && peerTable[i].hasPublicKey) {
+                    // Dedup: check we haven't already added this key
+                    bool dup = false;
+                    for (uint8_t k = 0; k < totalKeys; k++) {
+                        if (memcmp(allKeys[k].key, peerTable[i].publicKey, PUBKEY_LEN) == 0) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        memcpy(allKeys[totalKeys].key, peerTable[i].publicKey, PUBKEY_LEN);
+                        totalKeys++;
+                    }
+                }
+            }
+
+            // Select up to MAX_BEACON_PEERS, round-robin if more
+            uint8_t numToSend = (totalKeys <= MAX_BEACON_PEERS) ? totalKeys : MAX_BEACON_PEERS;
+            uint8_t startIdx = 0;
+            if (totalKeys > MAX_BEACON_PEERS) {
+                startIdx = beaconRoundRobin % totalKeys;
+                beaconRoundRobin++;
+            }
+
+            // Build V2 beacon: [type:0x02][numPeers:1B][pubKey_1:32B]...
+            pkt.payload[0] = BEACON_TYPE_PRESENCE_V2;
+            pkt.payload[1] = numToSend;
+            for (uint8_t p = 0; p < numToSend; p++) {
+                uint8_t idx = (startIdx + p) % totalKeys;
+                memcpy(pkt.payload + 2 + p * PUBKEY_LEN, allKeys[idx].key, PUBKEY_LEN);
+            }
+            pkt.payloadLen = 2 + numToSend * PUBKEY_LEN;
 
             addDedup(pkt.sender, pkt.msgID);
             meshTransmitRaw(pkt);
-            Serial.printf("[BEACON] Sent presence (phones=%d)\n", numPhones);
+            Serial.printf("[BEACON] Sent v2 presence (keys=%d/%d)\n", numToSend, totalKeys);
         }
     }
 
@@ -1939,8 +2083,8 @@ void loop() {
             for (int i = 0; i < (int)RELAY_QUEUE_SIZE; i++) {
                 if (relayQueue[i].pending) {
                     int state = radio.transmit(relayQueue[i].data, relayQueue[i].len);
-                    rxFlag = false;
                     radio.startReceive();
+                    rxFlag = false; // Clear AFTER startReceive to avoid losing RX interrupt
                     relayQueue[i].pending = false;
                     lastRelayTime = now;
                     relayJitterMs = 50 + (esp_random() % 100); // 50-150ms jitter
@@ -1972,25 +2116,39 @@ void loop() {
             lastPeerNotify = now;
             peerTableChanged = false;
 
-            // Build JSON: {"type":"peers","pigeonIDs":["a1b2c3d4","e5f6a7b8"]}
-            // Matches iOS app's expected format
-            char json[512];
-            int pos = snprintf(json, sizeof(json), "{\"type\":\"peers\",\"pigeonIDs\":[");
+            // Build JSON: {"type":"peers","peers":[{"pigeonID":"...","publicKey":"..."},...]}}
+            // Use heap to avoid large stack allocation (base64 keys are ~44 chars each)
+            size_t jsonBufSize = 2048;
+            char* json = (char*)malloc(jsonBufSize);
+            if (!json) {
+                Serial.println("[PEERS] malloc failed for notification");
+                return;
+            }
+            int pos = snprintf(json, jsonBufSize, "{\"type\":\"peers\",\"peers\":[");
             bool first = true;
             for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
-                if (peerTable[i].active) {
-                    // Bounds check: leave room for closing "]}" (2) + comma (1) + entry (~12)
-                    if (pos + 15 >= (int)sizeof(json)) break;
-                    if (!first) pos += snprintf(json + pos, sizeof(json) - pos, ",");
-                    pos += snprintf(json + pos, sizeof(json) - pos,
-                                    "\"%s\"", peerTable[i].pigeonID);
+                if (peerTable[i].active && peerTable[i].hasPublicKey) {
+                    // Base64 encode the public key
+                    char b64[48]; // 32 bytes -> 44 base64 chars + null
+                    size_t b64Len = 0;
+                    mbedtls_base64_encode((unsigned char*)b64, sizeof(b64), &b64Len,
+                                          peerTable[i].publicKey, PUBKEY_LEN);
+                    b64[b64Len] = '\0';
+
+                    // Bounds check: entry is ~70 chars
+                    if (pos + 80 >= (int)jsonBufSize) break;
+                    if (!first) pos += snprintf(json + pos, jsonBufSize - pos, ",");
+                    pos += snprintf(json + pos, jsonBufSize - pos,
+                                    "{\"pigeonID\":\"%s\",\"publicKey\":\"%s\"}",
+                                    peerTable[i].pigeonID, b64);
                     first = false;
                 }
             }
-            snprintf(json + pos, sizeof(json) - pos, "]}");
+            snprintf(json + pos, jsonBufSize - pos, "]}");
 
             pBridgeChar->setValue(json);
             pBridgeChar->notify();
+            free(json);
         }
     }
 
