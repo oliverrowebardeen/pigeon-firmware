@@ -1592,9 +1592,12 @@ void notifyBridgeStatus() {
         snprintf(json, sizeof(json),
             "{\"type\":\"bridge_status\",\"bridge\":\"wifi_connected\",\"ssid\":\"%s\",\"ip\":\"%s\"}",
             wifiSSID, WiFi.localIP().toString().c_str());
+    } else if (bridgeState == BRIDGE_OFFLINE) {
+        snprintf(json, sizeof(json),
+            "{\"type\":\"bridge_status\",\"bridge\":\"offline\",\"ssid\":\"%s\"}", wifiSSID);
     } else if (bridgeState == BRIDGE_NO_WIFI) {
         snprintf(json, sizeof(json), "{\"type\":\"bridge_status\",\"bridge\":\"no_wifi\"}");
-    } else {
+    } else { // BRIDGE_CONNECTING
         snprintf(json, sizeof(json),
             "{\"type\":\"bridge_status\",\"bridge\":\"connecting\",\"ssid\":\"%s\"}", wifiSSID);
     }
@@ -2201,9 +2204,9 @@ void loop() {
             Serial.println("[BRIDGE] Deferred connect notify");
             notifyBridgeStatus();
         }
-        // Periodic re-send for stable states only (not transient BRIDGE_CONNECTING)
+        // Periodic re-send for stable states (not transient CONNECTING/AUTH)
         if ((bridgeState == BRIDGE_ONLINE || bridgeState == BRIDGE_WIFI_ONLY ||
-             bridgeState == BRIDGE_AUTH) &&
+             bridgeState == BRIDGE_OFFLINE) &&
             now - lastBridgeStatusNotify >= BRIDGE_STATUS_INTERVAL_MS) {
             notifyBridgeStatus();
         }
