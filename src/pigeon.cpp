@@ -485,18 +485,19 @@ bool meshTransmitRaw(MeshPacket& pkt) {
     uint8_t buf[MAX_LORA_PACKET];
     size_t len = serializePacket(pkt, buf);
     int state = radio.transmit(buf, len);
-    rxFlag = false;
     radio.startReceive();
+    rxFlag = false; // Clear AFTER startReceive to avoid losing RX interrupt
     return state == RADIOLIB_ERR_NONE;
 }
 
 // Send fragmented message over LoRa mesh
 void meshSendFragmented(const uint8_t* dest, const uint8_t* data, size_t dataLen) {
     uint16_t fragGroupID = nextFragGroupID++;
-    // Skip 0x01xx range — reserved for presence beacon type byte discrimination
-    if ((fragGroupID >> 8) == BEACON_TYPE_PRESENCE) {
-        fragGroupID = 0x0200;
-        nextFragGroupID = 0x0201;
+    // Skip ranges where high byte matches a beacon type — prevents fragment/beacon
+    // misclassification in the LoRa receive dispatcher (payload[0] == beacon type check)
+    if ((fragGroupID >> 8) <= BEACON_TYPE_PRESENCE_V2) {
+        fragGroupID = (BEACON_TYPE_PRESENCE_V2 + 1) << 8; // 0x0300
+        nextFragGroupID = fragGroupID + 1;
     }
     uint8_t fragTotal = (dataLen + MAX_FRAG_DATA - 1) / MAX_FRAG_DATA;
     if (fragTotal == 0) fragTotal = 1;
@@ -965,7 +966,7 @@ void upsertPeer(const char* pid, const uint8_t* pubKey, bool hasPubKey,
     }
 
     // Upgrade: if we didn't have pubkey but now do, update it
-    if (hasPubKey && (!peerTable[slot].hasPublicKey || !peerTable[slot].active)) {
+    if (hasPubKey && pubKey && (!peerTable[slot].hasPublicKey || !peerTable[slot].active)) {
         memcpy(peerTable[slot].publicKey, pubKey, PUBKEY_LEN);
         peerTable[slot].hasPublicKey = true;
         peerTableChanged = true;
@@ -2122,7 +2123,7 @@ void loop() {
             char* json = (char*)malloc(jsonBufSize);
             if (!json) {
                 Serial.println("[PEERS] malloc failed for notification");
-                return;
+                goto skip_notify; // Don't return — remaining loop steps must still run
             }
             int pos = snprintf(json, jsonBufSize, "{\"type\":\"peers\",\"peers\":[");
             bool first = true;
@@ -2150,6 +2151,7 @@ void loop() {
             pBridgeChar->notify();
             free(json);
         }
+        skip_notify:;
     }
 
     // 8. Radio watchdog — ensure receive mode is active
