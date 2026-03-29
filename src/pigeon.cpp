@@ -227,8 +227,9 @@ BLECharacteristic* pAckChar = nullptr;
 BLECharacteristic* pBridgeChar = nullptr;
 volatile bool bleClientConnected = false;
 static uint32_t lastBridgeStatusNotify = 0;
-static bool pendingConnectNotify = false;
-static uint32_t connectNotifyTime = 0;
+volatile bool pendingConnectNotify = false;
+volatile uint32_t pendingNotifyStart = 0;
+static const uint32_t DEFERRED_NOTIFY_DELAY_MS = 500;
 
 // Queue for BLE->LoRa messages (phone wrote to us)
 static const size_t BLE_TX_QUEUE_SIZE = 4;
@@ -848,9 +849,11 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
         Serial.printf("[BRIDGE] WiFi provisioning: SSID='%s'\n", ssid);
         saveWiFiCredentials(ssid, pass);
         setupWiFi();
-        // Let WiFi.begin() coex handoff settle before BLE notification
-        delay(50);
-        notifyBridgeStatus();
+        // Defer notification — WiFi.begin() triggers a radio coex switch that
+        // can drop BLE notifications if sent immediately. Reuse the deferred
+        // notify mechanism (fires after DEFERRED_NOTIFY_DELAY_MS in loop).
+        pendingNotifyStart = millis();
+        pendingConnectNotify = true;
         return;
     }
 
@@ -1247,7 +1250,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             Serial.println("[WS] Disconnected");
             wsConnected = false;
             wsAuthenticated = false;
-            bridgeState = wifiConnected ? BRIDGE_WIFI_ONLY : BRIDGE_CONNECTING;
+            bridgeState = wifiConnected ? BRIDGE_OFFLINE : BRIDGE_CONNECTING;
             notifyBridgeStatus();
             break;
 
@@ -1658,8 +1661,8 @@ class ServerCallbacks : public BLEServerCallbacks {
                       lastBLEConnId, pServer->getConnectedCount());
         // Defer bridge status notification — give the phone time to discover
         // services and subscribe to notifications (~500ms typical on iOS)
+        pendingNotifyStart = millis();
         pendingConnectNotify = true;
-        connectNotifyTime = millis() + 500;
         BLEDevice::startAdvertising();
     }
     void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
@@ -2198,13 +2201,14 @@ void loop() {
     // 11. Deferred bridge status on connect + periodic re-notification
     if (bleClientConnected) {
         uint32_t now = millis();
-        // Deferred notification after BLE connect (gives phone time to subscribe)
-        if (pendingConnectNotify && (int32_t)(now - connectNotifyTime) >= 0) {
+        // Deferred notification after BLE connect or WiFi provisioning
+        if (pendingConnectNotify &&
+            now - pendingNotifyStart >= DEFERRED_NOTIFY_DELAY_MS) {
             pendingConnectNotify = false;
-            Serial.println("[BRIDGE] Deferred connect notify");
+            Serial.println("[BRIDGE] Deferred notify");
             notifyBridgeStatus();
         }
-        // Periodic re-send for stable states (not transient CONNECTING/AUTH)
+        // Periodic re-send for settled states (not transient CONNECTING/AUTH)
         if ((bridgeState == BRIDGE_ONLINE || bridgeState == BRIDGE_WIFI_ONLY ||
              bridgeState == BRIDGE_OFFLINE) &&
             now - lastBridgeStatusNotify >= BRIDGE_STATUS_INTERVAL_MS) {
@@ -2214,7 +2218,7 @@ void loop() {
         pendingConnectNotify = false;
     }
 
-    // 13. BLE advertising watchdog — restart if no client and interval elapsed
+    // 12. BLE advertising watchdog — restart if no client and interval elapsed
     if (!bleClientConnected) {
         uint32_t now = millis();
         if (now - lastBLEAdvRestart >= BLE_ADV_RESTART_MS) {
@@ -2223,7 +2227,7 @@ void loop() {
         }
     }
 
-    // 14. Update OLED display every second
+    // 13. Update OLED display every second
     {
         uint32_t now = millis();
         if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
