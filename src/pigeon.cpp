@@ -27,6 +27,7 @@
 #include <WebSocketsClient.h>
 #include "curve25519-donna.h"
 #include <mbedtls/md.h>
+#include <mbedtls/aes.h>
 
 // ============================================================================
 // Configuration
@@ -51,6 +52,30 @@ static const int8_t LORA_POWER      = 22;      // TX power in dBm (max)
 static const uint16_t LORA_PREAMBLE = 8;       // Preamble length
 static const float LORA_TCXO_V      = 1.8;     // TCXO voltage via DIO3
 
+// --- LoRa protocol mode ---
+enum LoRaMode : uint8_t { LORA_NATIVE = 0, LORA_MESHTASTIC = 1 };
+static LoRaMode loraMode = LORA_NATIVE;
+
+// --- Meshtastic LongFast radio parameters ---
+static const float MSHT_BW          = 250.0;   // kHz
+static const uint8_t MSHT_SF        = 11;
+static const uint8_t MSHT_CR        = 5;       // 4/5
+static const uint8_t MSHT_SYNC_WORD = 0x2B;
+static const uint16_t MSHT_PREAMBLE = 16;
+static const size_t MSHT_MAX_PACKET = 255;
+static const size_t MSHT_HEADER_SIZE = 16;
+static const size_t MSHT_MAX_PAYLOAD = 239;    // 255 - 16
+static const uint8_t MSHT_HOP_DEFAULT = 3;
+static const uint8_t MSHT_CHANNEL_HASH = 0x08; // xorHash("LongFast") ^ xorHash(defaultPSK)
+static const uint32_t MSHT_BROADCAST = 0xFFFFFFFF;
+static const uint16_t MSHT_PORTNUM_PRIVATE_APP = 256;
+
+// Meshtastic default PSK (LongFast, AES-128)
+static const uint8_t MSHT_DEFAULT_PSK[16] = {
+    0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59,
+    0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01
+};
+
 // --- Mesh parameters ---
 static const uint8_t DEFAULT_TTL         = 5;
 static const uint8_t BROADCAST_ADDR[6]   = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -64,6 +89,11 @@ static const size_t MAX_LORA_PACKET      = 250;
 // Payload includes 4-byte fragment header + data
 static const size_t FRAG_HEADER_SIZE     = 4;   // [fragGroupID:2][fragIdx:1][fragTotal:1]
 static const size_t MAX_FRAG_DATA        = MAX_LORA_PACKET - MESH_HEADER_SIZE - FRAG_HEADER_SIZE; // 230
+
+// Meshtastic protobuf overhead and max payload sizes
+static const size_t MSHT_PROTOBUF_OVERHEAD = 6;  // field1(3) + field2_tag(1) + varint_len(1-2)
+static const size_t MSHT_MAX_PIGEON_DATA = MSHT_MAX_PAYLOAD - MSHT_PROTOBUF_OVERHEAD; // 233
+// Note: no Pigeon fragmentation in Meshtastic mode — payloads must fit in one packet
 
 // --- LoRa reassembly ---
 static const size_t LORA_REASM_SLOTS     = 8;
@@ -199,6 +229,42 @@ struct BLEReasmSlot {
     bool active;
 };
 
+// --- Meshtastic packet header (16 bytes, little-endian on wire) ---
+struct MshtHeader {
+    uint32_t to;
+    uint32_t from;
+    uint32_t id;
+    uint8_t flags;
+    uint8_t channel;
+    uint8_t nextHop;
+    uint8_t relayNode;
+};
+
+struct MshtDedupEntry {
+    uint32_t from;
+    uint32_t id;
+    uint32_t timestamp;
+    bool active;
+};
+
+static const size_t NEIGHBOR_TABLE_SIZE = 16;
+struct NeighborEntry {
+    uint32_t nodeNum;
+    float rssi;
+    uint32_t lastSeen;
+    bool active;
+};
+
+struct MshtRelayItem {
+    uint8_t data[MSHT_MAX_PACKET];
+    size_t len;
+    uint32_t from;      // for suppression check
+    uint32_t id;        // for suppression check
+    uint32_t queuedAt;  // millis() when queued
+    uint32_t delayMs;   // RSSI-based delay
+    bool pending;
+};
+
 // ============================================================================
 // Globals
 // ============================================================================
@@ -216,6 +282,13 @@ uint16_t nextFragGroupID = 0;
 DedupEntry dedupTable[DEDUP_TABLE_SIZE];
 LoRaReasmSlot loraReasmTable[LORA_REASM_SLOTS];
 BLEReasmSlot bleReasmTable[BLE_REASM_SLOTS];
+
+// Meshtastic mode globals
+static uint32_t mshtNodeNum = 0;
+static uint32_t mshtPacketCounter = 0;
+MshtDedupEntry mshtDedupTable[DEDUP_TABLE_SIZE];
+NeighborEntry neighborTable[NEIGHBOR_TABLE_SIZE];
+MshtRelayItem mshtRelayQueue[RELAY_QUEUE_SIZE];
 
 volatile bool rxFlag = false;
 
@@ -409,12 +482,21 @@ void loadOrGenerateKey() {
         prefs.getBytes("pubkey", nodePublicKey, 32);
         Serial.println("[KEY] Loaded existing X25519 keypair from NVS");
     }
+
+    // Load LoRa protocol mode
+    loraMode = (LoRaMode)prefs.getUChar("lora_mode", LORA_NATIVE);
+
     prefs.end();
 
+    // Base64-encode the public key
     size_t b64Len = 0;
     mbedtls_base64_encode((unsigned char*)nodePublicKeyB64, sizeof(nodePublicKeyB64),
                           &b64Len, nodePublicKey, 32);
     nodePublicKeyB64[b64Len] = '\0';
+
+    // Derive Meshtastic NodeNum from first 4 bytes of public key (little-endian)
+    memcpy(&mshtNodeNum, nodePublicKey, 4);
+    if (mshtNodeNum == 0 || mshtNodeNum == MSHT_BROADCAST) mshtNodeNum = 0x00000001;
 }
 
 // ============================================================================
@@ -454,7 +536,184 @@ void addDedup(const uint8_t* sender, uint16_t msgID) {
 }
 
 // ============================================================================
-// Mesh packet serialization
+// Meshtastic helpers — crypto, codec, protobuf, dedup
+// ============================================================================
+
+// --- Header serialize/deserialize (little-endian on wire) ---
+
+void mshtSerializeHeader(const MshtHeader& h, uint8_t* buf) {
+    memcpy(buf + 0, &h.to, 4);
+    memcpy(buf + 4, &h.from, 4);
+    memcpy(buf + 8, &h.id, 4);
+    buf[12] = h.flags;
+    buf[13] = h.channel;
+    buf[14] = h.nextHop;
+    buf[15] = h.relayNode;
+}
+
+bool mshtDeserializeHeader(const uint8_t* buf, size_t len, MshtHeader& h) {
+    if (len < MSHT_HEADER_SIZE) return false;
+    memcpy(&h.to, buf + 0, 4);
+    memcpy(&h.from, buf + 4, 4);
+    memcpy(&h.id, buf + 8, 4);
+    h.flags = buf[12];
+    h.channel = buf[13];
+    h.nextHop = buf[14];
+    h.relayNode = buf[15];
+    return true;
+}
+
+// --- AES-128-CTR encrypt/decrypt (same operation for CTR mode) ---
+
+bool mshtAesCtr(const uint8_t* key, uint32_t packetId, uint32_t fromNode,
+                uint8_t* data, size_t len) {
+    uint8_t nonce[16] = {0};
+    uint64_t pid64 = packetId;
+    memcpy(nonce, &pid64, 8);        // bytes 0-7: packetId LE zero-extended
+    memcpy(nonce + 8, &fromNode, 4); // bytes 8-11: fromNode LE
+    // bytes 12-15: 0 (CTR block counter start)
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 128);
+
+    uint8_t stream[16] = {0};
+    size_t offset = 0;
+    int ret = mbedtls_aes_crypt_ctr(&aes, len, &offset, nonce, stream, data, data);
+    mbedtls_aes_free(&aes);
+    return ret == 0;
+}
+
+// --- Protobuf varint encode/decode (minimal, hand-rolled) ---
+
+size_t pbEncodeVarint(uint8_t* buf, uint32_t val) {
+    size_t i = 0;
+    while (val > 0x7F) { buf[i++] = (val & 0x7F) | 0x80; val >>= 7; }
+    buf[i++] = val & 0x7F;
+    return i;
+}
+
+uint32_t pbDecodeVarint(const uint8_t* buf, size_t len, size_t& pos) {
+    uint32_t val = 0;
+    uint8_t shift = 0;
+    while (pos < len) {
+        uint8_t b = buf[pos++];
+        val |= (uint32_t)(b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+        if (shift >= 35) break; // overflow guard
+    }
+    return val;
+}
+
+// Encode Pigeon data as protobuf Data{portnum=256, payload=pigeonData}
+size_t mshtEncodeData(const uint8_t* pigeonData, size_t pigeonLen, uint8_t* buf) {
+    size_t pos = 0;
+    buf[pos++] = 0x08; // field 1 (portnum), varint wire type
+    pos += pbEncodeVarint(buf + pos, MSHT_PORTNUM_PRIVATE_APP); // 256
+    buf[pos++] = 0x12; // field 2 (payload), length-delimited wire type
+    pos += pbEncodeVarint(buf + pos, pigeonLen);
+    memcpy(buf + pos, pigeonData, pigeonLen);
+    return pos + pigeonLen;
+}
+
+// Decode protobuf Data — extract portnum and payload fields
+bool mshtDecodeData(const uint8_t* buf, size_t len,
+                    uint32_t& portnum, const uint8_t*& outPayload, size_t& outLen) {
+    size_t pos = 0;
+    portnum = 0;
+    outPayload = nullptr;
+    outLen = 0;
+    while (pos < len) {
+        uint32_t tag = pbDecodeVarint(buf, len, pos);
+        uint32_t fieldNum = tag >> 3;
+        uint32_t wireType = tag & 0x07;
+        if (fieldNum == 1 && wireType == 0) {        // portnum, varint
+            portnum = pbDecodeVarint(buf, len, pos);
+        } else if (fieldNum == 2 && wireType == 2) { // payload, length-delimited
+            outLen = pbDecodeVarint(buf, len, pos);
+            if (outLen > len || pos + outLen > len) { outLen = 0; break; }
+            outPayload = buf + pos;
+            pos += outLen;
+        } else if (wireType == 0) {
+            pbDecodeVarint(buf, len, pos); // skip unknown varint
+        } else if (wireType == 2) {
+            uint32_t slen = pbDecodeVarint(buf, len, pos);
+            if (slen > len || pos + slen > len) break;
+            pos += slen; // skip unknown bytes
+        } else {
+            break; // unknown wire type, stop
+        }
+    }
+    return outPayload != nullptr;
+}
+
+// --- Meshtastic packet ID generation ---
+
+uint32_t mshtGeneratePacketId() {
+    uint32_t counter = (mshtPacketCounter++) & 0x3FF; // bottom 10 bits rolling
+    return counter | ((uint32_t)esp_random() & 0xFFFFFC00); // top 22 bits random
+}
+
+// --- Meshtastic dedup ---
+
+bool mshtIsDuplicate(uint32_t from, uint32_t id) {
+    uint32_t now = millis();
+    for (size_t i = 0; i < DEDUP_TABLE_SIZE; i++) {
+        if (mshtDedupTable[i].active) {
+            if (now - mshtDedupTable[i].timestamp > DEDUP_EXPIRY_MS) {
+                mshtDedupTable[i].active = false;
+                continue;
+            }
+            if (mshtDedupTable[i].from == from && mshtDedupTable[i].id == id)
+                return true;
+        }
+    }
+    return false;
+}
+
+void mshtAddDedup(uint32_t from, uint32_t id) {
+    size_t slot = 0;
+    uint32_t oldest = UINT32_MAX;
+    for (size_t i = 0; i < DEDUP_TABLE_SIZE; i++) {
+        if (!mshtDedupTable[i].active) { slot = i; break; }
+        if (mshtDedupTable[i].timestamp < oldest) {
+            oldest = mshtDedupTable[i].timestamp;
+            slot = i;
+        }
+    }
+    mshtDedupTable[slot] = {from, id, millis(), true};
+}
+
+// --- Neighbor RSSI table ---
+
+void updateNeighbor(uint32_t nodeNum, float rssi) {
+    size_t slot = 0;
+    uint32_t oldest = UINT32_MAX;
+    for (size_t i = 0; i < NEIGHBOR_TABLE_SIZE; i++) {
+        if (neighborTable[i].active && neighborTable[i].nodeNum == nodeNum) {
+            neighborTable[i].rssi = rssi;
+            neighborTable[i].lastSeen = millis();
+            return;
+        }
+        if (!neighborTable[i].active) { slot = i; oldest = 0; }
+        else if (neighborTable[i].lastSeen < oldest) {
+            oldest = neighborTable[i].lastSeen;
+            slot = i;
+        }
+    }
+    neighborTable[slot] = {nodeNum, rssi, millis(), true};
+}
+
+// RSSI-based relay delay: strong signal = short delay, weak = long delay
+uint32_t mshtRelayDelay(float rssi) {
+    if (rssi > -50.0f) return 20;
+    if (rssi < -130.0f) return 500;
+    return (uint32_t)(20.0f + (-50.0f - rssi) * (480.0f / 80.0f));
+}
+
+// ============================================================================
+// Mesh packet serialization (Pigeon Native)
 // ============================================================================
 
 size_t serializePacket(const MeshPacket& pkt, uint8_t* buf) {
@@ -541,6 +800,104 @@ void meshSendFragmented(const uint8_t* dest, const uint8_t* data, size_t dataLen
 
         // Small delay between fragments to avoid receiver overload
         if (i < fragTotal - 1) delay(100);
+    }
+}
+
+// ============================================================================
+// Meshtastic TX path
+// ============================================================================
+
+// Transmit a single Pigeon payload wrapped in a Meshtastic packet
+bool mshtTransmit(uint32_t destNode, const uint8_t* pigeonData, size_t pigeonLen) {
+    if (pigeonLen > MSHT_MAX_PIGEON_DATA) return false;
+
+    // Encode as protobuf Data{portnum=256, payload=pigeonData}
+    uint8_t pbBuf[MSHT_MAX_PAYLOAD];
+    size_t pbLen = mshtEncodeData(pigeonData, pigeonLen, pbBuf);
+
+    // AES-CTR encrypt the protobuf payload
+    uint32_t pktId = mshtGeneratePacketId();
+    mshtAesCtr(MSHT_DEFAULT_PSK, pktId, mshtNodeNum, pbBuf, pbLen);
+
+    // Build header
+    MshtHeader hdr;
+    hdr.to = destNode;
+    hdr.from = mshtNodeNum;
+    hdr.id = pktId;
+    hdr.flags = MSHT_HOP_DEFAULT | (MSHT_HOP_DEFAULT << 5); // hop_limit=3, hop_start=3
+    hdr.channel = MSHT_CHANNEL_HASH;
+    hdr.nextHop = 0;
+    hdr.relayNode = 0;
+
+    uint8_t buf[MSHT_MAX_PACKET];
+    mshtSerializeHeader(hdr, buf);
+    memcpy(buf + MSHT_HEADER_SIZE, pbBuf, pbLen);
+
+    mshtAddDedup(mshtNodeNum, pktId);
+
+    int state = radio.transmit(buf, MSHT_HEADER_SIZE + pbLen);
+    radio.startReceive();
+    rxFlag = false;
+    return state == RADIOLIB_ERR_NONE;
+}
+
+// Build V2 beacon payload into buffer. Returns payload length (0 if nothing to send).
+// Shared between Pigeon Native and Meshtastic modes.
+size_t buildBeaconPayload(uint8_t* buf, size_t bufSize) {
+    static uint8_t beaconRoundRobin = 0;
+
+    // Collect all known public keys: registered phones + peer table
+    struct PubKeyEntry { uint8_t key[PUBKEY_LEN]; };
+    PubKeyEntry allKeys[MAX_REGISTERED_PHONES + PEER_TABLE_SIZE];
+    uint8_t totalKeys = 0;
+
+    for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+        if (registeredPhones[i].active && registeredPhones[i].hasPublicKey) {
+            memcpy(allKeys[totalKeys].key, registeredPhones[i].publicKey, PUBKEY_LEN);
+            totalKeys++;
+        }
+    }
+    for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
+        if (peerTable[i].active && peerTable[i].hasPublicKey) {
+            bool dup = false;
+            for (uint8_t k = 0; k < totalKeys; k++) {
+                if (memcmp(allKeys[k].key, peerTable[i].publicKey, PUBKEY_LEN) == 0) {
+                    dup = true; break;
+                }
+            }
+            if (!dup) {
+                memcpy(allKeys[totalKeys].key, peerTable[i].publicKey, PUBKEY_LEN);
+                totalKeys++;
+            }
+        }
+    }
+
+    uint8_t numToSend = (totalKeys <= MAX_BEACON_PEERS) ? totalKeys : MAX_BEACON_PEERS;
+    uint8_t startIdx = 0;
+    if (totalKeys > MAX_BEACON_PEERS) {
+        startIdx = beaconRoundRobin % totalKeys;
+        beaconRoundRobin++;
+    }
+
+    size_t payloadLen = 2 + numToSend * PUBKEY_LEN;
+    if (payloadLen > bufSize) return 0;
+
+    buf[0] = BEACON_TYPE_PRESENCE_V2;
+    buf[1] = numToSend;
+    for (uint8_t p = 0; p < numToSend; p++) {
+        uint8_t idx = (startIdx + p) % totalKeys;
+        memcpy(buf + 2 + p * PUBKEY_LEN, allKeys[idx].key, PUBKEY_LEN);
+    }
+    return payloadLen;
+}
+
+// Send beacon wrapped in Meshtastic packet
+void sendMshtBeacon() {
+    uint8_t beaconBuf[MSHT_MAX_PIGEON_DATA];
+    size_t beaconLen = buildBeaconPayload(beaconBuf, sizeof(beaconBuf));
+    if (beaconLen > 0) {
+        mshtTransmit(MSHT_BROADCAST, beaconBuf, beaconLen);
+        Serial.printf("[MSHT BEACON] Sent v2 presence (%d bytes)\n", beaconLen);
     }
 }
 
@@ -719,6 +1076,125 @@ void handleLoRaReceive() {
 }
 
 // ============================================================================
+// Meshtastic RX path
+// ============================================================================
+
+void handleMshtReceive() {
+    uint8_t buf[MSHT_MAX_PACKET];
+    int state = radio.readData(buf, MSHT_MAX_PACKET);
+    if (state != RADIOLIB_ERR_NONE) {
+        if (state != -7) Serial.printf("[MSHT] Read error: %d\n", state);
+        radio.startReceive();
+        return;
+    }
+
+    size_t len = radio.getPacketLength();
+    lastRSSI = radio.getRSSI();
+    hasRSSI = true;
+
+    MshtHeader hdr;
+    if (!mshtDeserializeHeader(buf, len, hdr)) { radio.startReceive(); return; }
+    if (hdr.from == 0 || hdr.from == mshtNodeNum) { radio.startReceive(); return; }
+
+    // Duplicate check — also drives relay suppression
+    bool isDup = mshtIsDuplicate(hdr.from, hdr.id);
+
+    if (isDup) {
+        // Suppress any pending relay of this packet (heard from better node)
+        for (int q = 0; q < (int)RELAY_QUEUE_SIZE; q++) {
+            if (mshtRelayQueue[q].pending &&
+                mshtRelayQueue[q].from == hdr.from && mshtRelayQueue[q].id == hdr.id) {
+                mshtRelayQueue[q].pending = false;
+            }
+        }
+        radio.startReceive();
+        return;
+    }
+
+    mshtAddDedup(hdr.from, hdr.id);
+    updateNeighbor(hdr.from, lastRSSI);
+    statLoRaRx++;
+
+    // Queue for relay if hop_limit > 0
+    uint8_t hopLimit = hdr.flags & 0x07;
+    if (hopLimit > 0) {
+        // Decrement hop_limit, set relay_node to our last byte
+        buf[12] = (hdr.flags & 0xF8) | ((hopLimit - 1) & 0x07);
+        buf[15] = (uint8_t)(mshtNodeNum & 0xFF);
+
+        uint32_t relayDelay = mshtRelayDelay(lastRSSI);
+        for (int q = 0; q < (int)RELAY_QUEUE_SIZE; q++) {
+            if (!mshtRelayQueue[q].pending) {
+                memcpy(mshtRelayQueue[q].data, buf, len);
+                mshtRelayQueue[q].len = len;
+                mshtRelayQueue[q].from = hdr.from;
+                mshtRelayQueue[q].id = hdr.id;
+                mshtRelayQueue[q].queuedAt = millis();
+                mshtRelayQueue[q].delayMs = relayDelay;
+                mshtRelayQueue[q].pending = true;
+                break;
+            }
+        }
+    }
+
+    // Decrypt payload
+    size_t payloadLen = len - MSHT_HEADER_SIZE;
+    if (payloadLen == 0) { radio.startReceive(); return; }
+
+    uint8_t decrypted[MSHT_MAX_PAYLOAD];
+    memcpy(decrypted, buf + MSHT_HEADER_SIZE, payloadLen);
+    mshtAesCtr(MSHT_DEFAULT_PSK, hdr.id, hdr.from, decrypted, payloadLen);
+
+    // Parse protobuf — extract portnum and payload
+    uint32_t portnum = 0;
+    const uint8_t* pigeonData = nullptr;
+    size_t pigeonLen = 0;
+    if (!mshtDecodeData(decrypted, payloadLen, portnum, pigeonData, pigeonLen)) {
+        radio.startReceive();
+        return; // Can't parse protobuf — still relayed above
+    }
+
+    if (portnum != MSHT_PORTNUM_PRIVATE_APP || pigeonLen == 0) {
+        // Stock Meshtastic traffic — relay only, no BLE delivery
+        Serial.printf("[MSHT RX] Stock Meshtastic portnum=%d from=%08X (relay only)\n",
+                      portnum, hdr.from);
+        radio.startReceive();
+        return;
+    }
+
+    // Pigeon payload — process beacon or deliver raw to BLE
+    bool isBeacon = (pigeonData[0] == BEACON_TYPE_PRESENCE ||
+                     pigeonData[0] == BEACON_TYPE_PRESENCE_V2);
+
+    if (isBeacon && pigeonLen >= 2 && pigeonLen <= 255) {
+        // Beacon: handle for peer discovery (not delivered to BLE)
+        uint8_t senderPadded[6] = {0};
+        memcpy(senderPadded + 2, &hdr.from, 4);
+        handlePresenceBeacon(senderPadded, pigeonData, (uint8_t)pigeonLen, lastRSSI);
+    } else {
+        // Non-beacon payload (e.g. CompactEnvelope from iOS) — deliver raw to BLE
+        bool queued = false;
+        for (int q = 0; q < (int)LORA_RX_QUEUE_SIZE; q++) {
+            if (!loraRxQueue[q].pending) {
+                memcpy(loraRxQueue[q].data, pigeonData, pigeonLen);
+                loraRxQueue[q].len = pigeonLen;
+                loraRxQueue[q].pending = true;
+                queued = true;
+                break;
+            }
+        }
+        if (queued) {
+            Serial.printf("[MSHT RX] from=%08X payload=%d bytes, queued for BLE\n",
+                          hdr.from, pigeonLen);
+        } else {
+            Serial.println("[MSHT RX] LoRa->BLE queue full, dropping payload");
+        }
+    }
+
+    radio.startReceive();
+}
+
+// ============================================================================
 // BLE chunk reassembly (incoming from phone)
 // ============================================================================
 
@@ -838,8 +1314,30 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
         return;
     }
 
+    // LoRa mode switch: {"lora_mode":"meshtastic"} or {"lora_mode":"native"}
+    if (doc.containsKey("lora_mode")) {
+        const char* mode = doc["lora_mode"];
+        LoRaMode newMode = LORA_NATIVE;
+        if (mode && strcmp(mode, "meshtastic") == 0) newMode = LORA_MESHTASTIC;
+
+        Preferences prefs;
+        prefs.begin("pigeon", false);
+        prefs.putUChar("lora_mode", newMode);
+        prefs.end();
+
+        Serial.printf("[BRIDGE] LoRa mode set to %s, rebooting...\n",
+                      newMode == LORA_MESHTASTIC ? "Meshtastic" : "Native");
+        delay(500);
+        ESP.restart();
+        return;
+    }
+
     // WiFi provisioning: {"ssid":"...", "pass":"..."}
     if (doc.containsKey("ssid")) {
+        if (loraMode == LORA_MESHTASTIC) {
+            Serial.println("[BRIDGE] WiFi bridge not available in Meshtastic mode");
+            return;
+        }
         const char* ssid = doc["ssid"];
         const char* pass = doc["pass"] | "";
         if (!ssid || strlen(ssid) == 0) {
@@ -1568,11 +2066,13 @@ void updateIdentityCharacteristic() {
         "\"bridgeEnabled\":%s,"
         "\"isMeshNode\":true,"
         "\"relayReachable\":%s,"
+        "\"loraMode\":\"%s\","
         "\"bridgeCapacityRemaining\":0}",
         nodePublicKeyB64,
         nodePigeonID,
         wifiConfigured ? "true" : "false",
-        (bridgeState == BRIDGE_ONLINE) ? "true" : "false"
+        (bridgeState == BRIDGE_ONLINE) ? "true" : "false",
+        loraMode == LORA_MESHTASTIC ? "meshtastic" : "native"
     );
     pIdentityChar->setValue(json);
 }
@@ -1807,6 +2307,28 @@ void setupBLE() {
 // LoRa setup
 // ============================================================================
 
+void applyRadioConfig() {
+    if (loraMode == LORA_MESHTASTIC) {
+        radio.setBandwidth(MSHT_BW);
+        radio.setSpreadingFactor(MSHT_SF);
+        radio.setCodingRate(MSHT_CR);
+        radio.setSyncWord(MSHT_SYNC_WORD);
+        radio.setPreambleLength(MSHT_PREAMBLE);
+        Serial.println("[LORA] Mode: Meshtastic LongFast (SF11/BW250/0x2B)");
+    } else {
+        radio.setBandwidth(LORA_BW);
+        radio.setSpreadingFactor(LORA_SF);
+        radio.setCodingRate(LORA_CR);
+        radio.setSyncWord(LORA_SYNC_WORD);
+        radio.setPreambleLength(LORA_PREAMBLE);
+        Serial.println("[LORA] Mode: Pigeon Native (SF9/BW125/0x12)");
+    }
+    radio.setFrequency(LORA_FREQ);
+    radio.setOutputPower(LORA_POWER);
+    radio.setCRC(2);
+    radio.setRxBoostedGainMode(true);
+}
+
 void setupLoRa() {
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
@@ -1818,15 +2340,7 @@ void setupLoRa() {
     }
     radio.setDio2AsRfSwitch(true);
     radio.setTCXO(LORA_TCXO_V);
-    radio.setFrequency(LORA_FREQ);
-    radio.setBandwidth(LORA_BW);
-    radio.setSpreadingFactor(LORA_SF);
-    radio.setCodingRate(LORA_CR);
-    radio.setSyncWord(LORA_SYNC_WORD);
-    radio.setOutputPower(LORA_POWER);
-    radio.setPreambleLength(LORA_PREAMBLE);
-    radio.setCRC(2);
-    radio.setRxBoostedGainMode(true);
+    applyRadioConfig();
     Serial.println(" OK");
 
     radio.setPacketReceivedAction(onReceive);
@@ -1882,19 +2396,23 @@ void updateDisplay() {
     }
     u8x8.print(line);
 
-    // Bridge status
+    // Line 5: Mode/Bridge status
     u8x8.setCursor(0, 5);
-    const char* bStatus;
-    switch (bridgeState) {
-        case BRIDGE_NO_WIFI:   bStatus = "No WiFi";    break;
-        case BRIDGE_CONNECTING: bStatus = "Connecting"; break;
-        case BRIDGE_WIFI_ONLY: bStatus = "WiFi Only";  break;
-        case BRIDGE_AUTH:      bStatus = "Auth...";     break;
-        case BRIDGE_ONLINE:    bStatus = "Online";      break;
-        case BRIDGE_OFFLINE:   bStatus = "Offline";     break;
-        default:               bStatus = "?";           break;
+    if (loraMode == LORA_MESHTASTIC) {
+        snprintf(line, sizeof(line), "Mode:Meshtastic ");
+    } else {
+        const char* bStatus;
+        switch (bridgeState) {
+            case BRIDGE_NO_WIFI:   bStatus = "No WiFi";    break;
+            case BRIDGE_CONNECTING: bStatus = "Connecting"; break;
+            case BRIDGE_WIFI_ONLY: bStatus = "WiFi Only";  break;
+            case BRIDGE_AUTH:      bStatus = "Auth...";     break;
+            case BRIDGE_ONLINE:    bStatus = "Online";      break;
+            case BRIDGE_OFFLINE:   bStatus = "Offline";     break;
+            default:               bStatus = "?";           break;
+        }
+        snprintf(line, sizeof(line), "Bridge:%-9s", bStatus);
     }
-    snprintf(line, sizeof(line), "Bridge:%-9s", bStatus);
     u8x8.print(line);
 
     // LoRa packet stats
@@ -1961,6 +2479,10 @@ void setup() {
     memset(nodeTable, 0, sizeof(nodeTable));
     memset(relayQueue, 0, sizeof(relayQueue));
     memset(msgDedupTable, 0, sizeof(msgDedupTable));
+    memset(mshtDedupTable, 0, sizeof(mshtDedupTable));
+    memset(mshtRelayQueue, 0, sizeof(mshtRelayQueue));
+    memset(neighborTable, 0, sizeof(neighborTable));
+    mshtPacketCounter = esp_random() & 0x3FF;
 
     // Create BLE event queue before starting BLE (callbacks use it)
     bleEventQueue = xQueueCreate(BLE_EVENT_QUEUE_LEN, sizeof(BLEEvent));
@@ -1968,13 +2490,23 @@ void setup() {
     setupLoRa();
     setupBLE();
 
-    loadWiFiCredentials();
-    setupWiFi();
+    // WiFi/bridge only available in Native mode
+    if (loraMode == LORA_NATIVE) {
+        loadWiFiCredentials();
+        setupWiFi();
+    } else {
+        WiFi.mode(WIFI_OFF);
+        bridgeState = BRIDGE_NO_WIFI;
+    }
 
     // Offset beacon timing so nodes don't all beacon at the same instant
     lastBeaconTime = millis() - BEACON_INTERVAL_MS + (nodeAddr[5] * 37 % BEACON_INTERVAL_MS);
 
     Serial.println();
+    Serial.printf("[PIGEON] LoRa mode: %s\n",
+                  loraMode == LORA_MESHTASTIC ? "Meshtastic Compatible" : "Pigeon Native");
+    if (loraMode == LORA_MESHTASTIC)
+        Serial.printf("[PIGEON] Meshtastic NodeNum: %08X\n", mshtNodeNum);
     Serial.println("[PIGEON] Node ready. BLE + LoRa mesh active.");
     Serial.println();
 
@@ -1987,7 +2519,8 @@ void loop() {
     // 1. Handle LoRa received packets
     if (rxFlag) {
         rxFlag = false;
-        handleLoRaReceive();
+        if (loraMode == LORA_MESHTASTIC) handleMshtReceive();
+        else handleLoRaReceive();
     }
 
     // 2. Process BLE event queue (thread-safe handoff from BLE callbacks)
@@ -1997,7 +2530,14 @@ void loop() {
             handleBLEChunkWrite(evt.data, evt.len);
         } else if (evt.type == BLE_EVENT_ACK_WRITE) {
             Serial.printf("[BLE ACK] Received %d bytes, broadcasting over LoRa\n", evt.len);
-            meshSendFragmented(BROADCAST_ADDR, evt.data, evt.len);
+            if (loraMode == LORA_MESHTASTIC) {
+                if (evt.len <= MSHT_MAX_PIGEON_DATA)
+                    mshtTransmit(MSHT_BROADCAST, evt.data, evt.len);
+                else
+                    Serial.printf("[MSHT] ACK too large for single packet: %d > %d\n", evt.len, MSHT_MAX_PIGEON_DATA);
+            } else {
+                meshSendFragmented(BROADCAST_ADDR, evt.data, evt.len);
+            }
         } else if (evt.type == BLE_EVENT_BRIDGE_WRITE) {
             handleBridgeWrite(evt.data, evt.len);
         }
@@ -2007,8 +2547,17 @@ void loop() {
     for (int i = 0; i < (int)BLE_TX_QUEUE_SIZE; i++) {
         if (bleTxQueue[i].pending) {
             Serial.printf("[MESH] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
-            meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
-            bridgeToRelay(bleTxQueue[i].data, bleTxQueue[i].len);
+            if (loraMode == LORA_MESHTASTIC) {
+                if (bleTxQueue[i].len <= MSHT_MAX_PIGEON_DATA) {
+                    mshtTransmit(MSHT_BROADCAST, bleTxQueue[i].data, bleTxQueue[i].len);
+                } else {
+                    Serial.printf("[MSHT] BLE payload too large for single packet: %d > %d\n",
+                                  bleTxQueue[i].len, MSHT_MAX_PIGEON_DATA);
+                }
+            } else {
+                meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
+                bridgeToRelay(bleTxQueue[i].data, bleTxQueue[i].len);
+            }
             bleTxQueue[i].pending = false;
             statBleIn++;
         }
@@ -2018,8 +2567,9 @@ void loop() {
     for (int i = 0; i < (int)LORA_RX_QUEUE_SIZE; i++) {
         if (loraRxQueue[i].pending) {
             Serial.printf("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
-            // Bridge to relay server using full data (with routing header)
-            bridgeToRelay(loraRxQueue[i].data, loraRxQueue[i].len);
+            // Bridge to relay server using full data (Native mode only)
+            if (loraMode == LORA_NATIVE)
+                bridgeToRelay(loraRxQueue[i].data, loraRxQueue[i].len);
             // Strip routing header before BLE delivery — phone expects raw envelope JSON.
             // All messages through the mesh have a routing header prepended by the sender.
             // Detect by checking if data after the header starts with '{' (valid JSON envelope).
@@ -2038,104 +2588,85 @@ void loop() {
 
     // 5. LoRa heartbeat beacon with presence info (gossip: local + remote peers)
     {
-        static uint8_t beaconRoundRobin = 0; // For round-robin when > MAX_BEACON_PEERS
-
         uint32_t now = millis();
         if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
             lastBeaconTime = now;
-            MeshPacket pkt;
-            memcpy(pkt.sender, nodeAddr, ADDR_LEN);
-            memcpy(pkt.dest, BROADCAST_ADDR, ADDR_LEN);
-            pkt.msgID = nextMsgID++;
-            pkt.ttl = 1; // Each node re-beacons its full knowledge (gossip)
 
-            // Collect all known public keys: registered phones + peer table
-            // Use a temp array to gather keys, then pick up to MAX_BEACON_PEERS
-            struct PubKeyEntry { uint8_t key[PUBKEY_LEN]; };
-            PubKeyEntry allKeys[MAX_REGISTERED_PHONES + PEER_TABLE_SIZE];
-            uint8_t totalKeys = 0;
+            if (loraMode == LORA_MESHTASTIC) {
+                sendMshtBeacon();
+            } else {
+                MeshPacket pkt;
+                memcpy(pkt.sender, nodeAddr, ADDR_LEN);
+                memcpy(pkt.dest, BROADCAST_ADDR, ADDR_LEN);
+                pkt.msgID = nextMsgID++;
+                pkt.ttl = 1;
 
-            // Local registered phones with public keys
-            for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
-                if (registeredPhones[i].active && registeredPhones[i].hasPublicKey) {
-                    memcpy(allKeys[totalKeys].key, registeredPhones[i].publicKey, PUBKEY_LEN);
-                    totalKeys++;
+                pkt.payloadLen = buildBeaconPayload(pkt.payload, sizeof(pkt.payload));
+                if (pkt.payloadLen > 0) {
+                    addDedup(pkt.sender, pkt.msgID);
+                    meshTransmitRaw(pkt);
+                    uint8_t numKeys = pkt.payload[1];
+                    Serial.printf("[BEACON] Sent v2 presence (keys=%d)\n", numKeys);
                 }
             }
-
-            // Remote peers with public keys (gossip)
-            for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
-                if (peerTable[i].active && peerTable[i].hasPublicKey) {
-                    // Dedup: check we haven't already added this key
-                    bool dup = false;
-                    for (uint8_t k = 0; k < totalKeys; k++) {
-                        if (memcmp(allKeys[k].key, peerTable[i].publicKey, PUBKEY_LEN) == 0) {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if (!dup) {
-                        memcpy(allKeys[totalKeys].key, peerTable[i].publicKey, PUBKEY_LEN);
-                        totalKeys++;
-                    }
-                }
-            }
-
-            // Select up to MAX_BEACON_PEERS, round-robin if more
-            uint8_t numToSend = (totalKeys <= MAX_BEACON_PEERS) ? totalKeys : MAX_BEACON_PEERS;
-            uint8_t startIdx = 0;
-            if (totalKeys > MAX_BEACON_PEERS) {
-                startIdx = beaconRoundRobin % totalKeys;
-                beaconRoundRobin++;
-            }
-
-            // Build V2 beacon: [type:0x02][numPeers:1B][pubKey_1:32B]...
-            pkt.payload[0] = BEACON_TYPE_PRESENCE_V2;
-            pkt.payload[1] = numToSend;
-            for (uint8_t p = 0; p < numToSend; p++) {
-                uint8_t idx = (startIdx + p) % totalKeys;
-                memcpy(pkt.payload + 2 + p * PUBKEY_LEN, allKeys[idx].key, PUBKEY_LEN);
-            }
-            pkt.payloadLen = 2 + numToSend * PUBKEY_LEN;
-
-            addDedup(pkt.sender, pkt.msgID);
-            meshTransmitRaw(pkt);
-            Serial.printf("[BEACON] Sent v2 presence (keys=%d/%d)\n", numToSend, totalKeys);
         }
     }
 
     // 6. Drain relay queue with jitter (deferred relay to avoid fragment loss during RX)
     // All radio operations happen on this task — no mutex needed (single-threaded loop)
-    {
+    if (loraMode == LORA_MESHTASTIC) {
+        // Meshtastic relay: RSSI-proportional delay with suppression
+        uint32_t now = millis();
+        for (int i = 0; i < (int)RELAY_QUEUE_SIZE; i++) {
+            if (mshtRelayQueue[i].pending &&
+                (now - mshtRelayQueue[i].queuedAt) >= mshtRelayQueue[i].delayMs) {
+                int state = radio.transmit(mshtRelayQueue[i].data, mshtRelayQueue[i].len);
+                radio.startReceive();
+                rxFlag = false;
+                mshtRelayQueue[i].pending = false;
+                if (state == RADIOLIB_ERR_NONE) {
+                    statRelay++;
+                } else {
+                    Serial.printf("[MSHT RELAY] TX failed: %d\n", state);
+                }
+                break; // one per cycle
+            }
+        }
+    } else {
+        // Native relay: random jitter
         uint32_t now = millis();
         if (now - lastRelayTime >= relayJitterMs) {
             for (int i = 0; i < (int)RELAY_QUEUE_SIZE; i++) {
                 if (relayQueue[i].pending) {
                     int state = radio.transmit(relayQueue[i].data, relayQueue[i].len);
                     radio.startReceive();
-                    rxFlag = false; // Clear AFTER startReceive to avoid losing RX interrupt
+                    rxFlag = false;
                     relayQueue[i].pending = false;
                     lastRelayTime = now;
-                    relayJitterMs = 50 + (esp_random() % 100); // 50-150ms jitter
+                    relayJitterMs = 50 + (esp_random() % 100);
                     if (state == RADIOLIB_ERR_NONE) {
                         statRelay++;
                     } else {
                         Serial.printf("[RELAY] TX failed: %d\n", state);
                     }
-                    // Only relay one packet per drain cycle
                     break;
                 }
             }
         }
     }
 
-    // 7. Expire stale peers and send BLE peer presence notifications
+    // 7. Expire stale peers, neighbors, and send BLE peer presence notifications
     {
         uint32_t now = millis();
         static uint32_t lastPeerExpiry = 0;
         if (now - lastPeerExpiry >= 1000) {
             lastPeerExpiry = now;
             expirePeers();
+            // Expire RSSI neighbors (5 min)
+            for (size_t i = 0; i < NEIGHBOR_TABLE_SIZE; i++) {
+                if (neighborTable[i].active && (now - neighborTable[i].lastSeen) > 300000)
+                    neighborTable[i].active = false;
+            }
         }
 
         bool shouldNotify = peerTableChanged ||
@@ -2192,11 +2723,11 @@ void loop() {
         }
     }
 
-    // 9. WiFi connection management
-    wifiLoop();
+    // 9. WiFi connection management (Native mode only)
+    if (loraMode == LORA_NATIVE) wifiLoop();
 
-    // 10. WebSocket relay connection
-    wsLoop();
+    // 10. WebSocket relay connection (Native mode only)
+    if (loraMode == LORA_NATIVE) wsLoop();
 
     // 11. Deferred bridge status on connect + periodic re-notification
     if (bleClientConnected) {
