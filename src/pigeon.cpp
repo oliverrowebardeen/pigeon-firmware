@@ -388,8 +388,50 @@ static BridgeState bridgeState = BRIDGE_NO_WIFI;
 
 // Relay server
 static const char* RELAY_HOST = "relay.example.com";
-static const uint16_t RELAY_PORT = 8080;
+static const uint16_t RELAY_PORT = 443;
 static const char* RELAY_PATH = "/v1/ws";
+static const char RELAY_ROOT_CA[] PROGMEM = R"CERT(
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)CERT";
+static const char* WIFI_PASS_LEGACY_KEY = "wifi_pass";
+static const char* WIFI_PASS_VERSION_KEY = "wifi_pw_ver";
+static const char* WIFI_PASS_LENGTH_KEY = "wifi_pw_len";
+static const char* WIFI_PASS_IV_KEY = "wifi_pw_iv";
+static const char* WIFI_PASS_CT_KEY = "wifi_pw_ct";
+static const char* WIFI_PASS_MAC_KEY = "wifi_pw_mac";
+static const uint8_t WIFI_PASS_STORAGE_VERSION = 1;
+static const size_t WIFI_PASS_IV_LEN = 16;
+static const size_t WIFI_PASS_MAC_LEN = 16;
 
 // WebSocket state
 WebSocketsClient webSocket;
@@ -1315,7 +1357,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
     }
 
     // LoRa mode switch: {"lora_mode":"meshtastic"} or {"lora_mode":"native"}
-    if (doc.containsKey("lora_mode")) {
+    if (!doc["lora_mode"].isNull()) {
         const char* mode = doc["lora_mode"];
         LoRaMode newMode = LORA_NATIVE;
         if (mode && strcmp(mode, "meshtastic") == 0) newMode = LORA_MESHTASTIC;
@@ -1333,7 +1375,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
     }
 
     // WiFi provisioning: {"ssid":"...", "pass":"..."}
-    if (doc.containsKey("ssid")) {
+    if (!doc["ssid"].isNull()) {
         if (loraMode == LORA_MESHTASTIC) {
             Serial.println("[BRIDGE] WiFi bridge not available in Meshtastic mode");
             return;
@@ -1344,7 +1386,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
             Serial.println("[BRIDGE] Empty SSID, ignoring");
             return;
         }
-        Serial.printf("[BRIDGE] WiFi provisioning: SSID='%s'\n", ssid);
+        Serial.println("[BRIDGE] WiFi provisioning requested");
         saveWiFiCredentials(ssid, pass);
         setupWiFi();
         // Defer notification — WiFi.begin() triggers a radio coex switch that
@@ -1356,7 +1398,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
     }
 
     // WiFi disconnect: {"wifi":"off"}
-    if (doc.containsKey("wifi")) {
+    if (!doc["wifi"].isNull()) {
         const char* wifiCmd = doc["wifi"];
         if (wifiCmd && strcmp(wifiCmd, "off") == 0) {
             Serial.println("[BRIDGE] WiFi disconnect requested");
@@ -1593,6 +1635,136 @@ bool hmacSHA256(const uint8_t* key, size_t keyLen,
     return mbedtls_md_hmac(md, key, keyLen, msg, msgLen, out) == 0;
 }
 
+bool aesCtrCrypt(const uint8_t* key, size_t keyBits,
+                 const uint8_t* nonce, uint8_t* data, size_t len) {
+    uint8_t nonceCounter[16];
+    memcpy(nonceCounter, nonce, sizeof(nonceCounter));
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    int ret = mbedtls_aes_setkey_enc(&aes, key, keyBits);
+    if (ret == 0) {
+        uint8_t stream[16] = {0};
+        size_t offset = 0;
+        ret = mbedtls_aes_crypt_ctr(&aes, len, &offset, nonceCounter, stream, data, data);
+    }
+    mbedtls_aes_free(&aes);
+    return ret == 0;
+}
+
+bool secureZeroCompare(const uint8_t* a, const uint8_t* b, size_t len) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; i++) diff |= (a[i] ^ b[i]);
+    return diff == 0;
+}
+
+// Derives a storage key from nodePrivateKey. If the private key is ever
+// regenerated, previously encrypted WiFi passwords become inaccessible.
+bool deriveWiFiStorageKey(const char* info, uint8_t* out, size_t outLen) {
+    static const uint8_t salt[] = "pigeon-wifi-storage-v1";
+    return hkdfSHA256(
+        salt, sizeof(salt) - 1,
+        nodePrivateKey, sizeof(nodePrivateKey),
+        (const uint8_t*)info, strlen(info),
+        out, outLen
+    );
+}
+
+bool storeEncryptedWiFiPassword(Preferences& prefs, const char* pass) {
+    size_t passLen = strnlen(pass, sizeof(wifiPass) - 1);
+    if (passLen >= sizeof(wifiPass)) return false;
+
+    uint8_t encKey[32];
+    uint8_t macKey[32];
+    if (!deriveWiFiStorageKey("wifi-pass-enc", encKey, sizeof(encKey)) ||
+        !deriveWiFiStorageKey("wifi-pass-mac", macKey, sizeof(macKey))) {
+        return false;
+    }
+
+    uint8_t iv[WIFI_PASS_IV_LEN];
+    uint8_t ciphertext[sizeof(wifiPass) - 1] = {0};
+    uint8_t mac[32];
+    uint8_t macInput[1 + WIFI_PASS_IV_LEN + (sizeof(wifiPass) - 1)] = {0};
+
+    esp_fill_random(iv, sizeof(iv));
+    if (passLen > 0) {
+        memcpy(ciphertext, pass, passLen);
+        if (!aesCtrCrypt(encKey, 256, iv, ciphertext, passLen)) return false;
+    }
+
+    macInput[0] = WIFI_PASS_STORAGE_VERSION;
+    memcpy(macInput + 1, iv, sizeof(iv));
+    if (passLen > 0) memcpy(macInput + 1 + sizeof(iv), ciphertext, passLen);
+    if (!hmacSHA256(macKey, sizeof(macKey), macInput, 1 + sizeof(iv) + passLen, mac)) {
+        return false;
+    }
+
+    prefs.putUChar(WIFI_PASS_VERSION_KEY, WIFI_PASS_STORAGE_VERSION);
+    prefs.putUChar(WIFI_PASS_LENGTH_KEY, (uint8_t)passLen);
+    if (prefs.putBytes(WIFI_PASS_IV_KEY, iv, sizeof(iv)) != sizeof(iv)) return false;
+    if (passLen > 0 && prefs.putBytes(WIFI_PASS_CT_KEY, ciphertext, passLen) != passLen) return false;
+    if (passLen == 0) prefs.remove(WIFI_PASS_CT_KEY);
+    if (prefs.putBytes(WIFI_PASS_MAC_KEY, mac, WIFI_PASS_MAC_LEN) != WIFI_PASS_MAC_LEN) return false;
+    prefs.remove(WIFI_PASS_LEGACY_KEY);
+    return true;
+}
+
+bool loadEncryptedWiFiPassword(Preferences& prefs, char* out, size_t outSize) {
+    if (prefs.getUChar(WIFI_PASS_VERSION_KEY, 0) != WIFI_PASS_STORAGE_VERSION) {
+        return false;
+    }
+
+    size_t passLen = prefs.getUChar(WIFI_PASS_LENGTH_KEY, 0xFF);
+    if (passLen == 0xFF || passLen >= outSize) {
+        return false;
+    }
+
+    uint8_t iv[WIFI_PASS_IV_LEN];
+    uint8_t storedMac[WIFI_PASS_MAC_LEN];
+    if (prefs.getBytes(WIFI_PASS_IV_KEY, iv, sizeof(iv)) != sizeof(iv)) return false;
+    if (prefs.getBytes(WIFI_PASS_MAC_KEY, storedMac, sizeof(storedMac)) != sizeof(storedMac)) return false;
+
+    uint8_t ciphertext[sizeof(wifiPass) - 1] = {0};
+    if (passLen > 0 && prefs.getBytes(WIFI_PASS_CT_KEY, ciphertext, passLen) != passLen) {
+        return false;
+    }
+
+    uint8_t encKey[32];
+    uint8_t macKey[32];
+    if (!deriveWiFiStorageKey("wifi-pass-enc", encKey, sizeof(encKey)) ||
+        !deriveWiFiStorageKey("wifi-pass-mac", macKey, sizeof(macKey))) {
+        return false;
+    }
+
+    uint8_t macInput[1 + WIFI_PASS_IV_LEN + (sizeof(wifiPass) - 1)] = {0};
+    macInput[0] = WIFI_PASS_STORAGE_VERSION;
+    memcpy(macInput + 1, iv, sizeof(iv));
+    if (passLen > 0) memcpy(macInput + 1 + sizeof(iv), ciphertext, passLen);
+
+    uint8_t computedMac[32];
+    if (!hmacSHA256(macKey, sizeof(macKey), macInput, 1 + sizeof(iv) + passLen, computedMac) ||
+        !secureZeroCompare(storedMac, computedMac, WIFI_PASS_MAC_LEN)) {
+        return false;
+    }
+
+    if (passLen > 0 && !aesCtrCrypt(encKey, 256, iv, ciphertext, passLen)) {
+        return false;
+    }
+
+    memcpy(out, ciphertext, passLen);
+    out[passLen] = '\0';
+    return true;
+}
+
+void clearStoredWiFiPassword(Preferences& prefs) {
+    prefs.remove(WIFI_PASS_LEGACY_KEY);
+    prefs.remove(WIFI_PASS_VERSION_KEY);
+    prefs.remove(WIFI_PASS_LENGTH_KEY);
+    prefs.remove(WIFI_PASS_IV_KEY);
+    prefs.remove(WIFI_PASS_CT_KEY);
+    prefs.remove(WIFI_PASS_MAC_KEY);
+}
+
 // Parse UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" to 16 raw bytes
 bool parseUUID(const char* uuid, uint8_t* out) {
     int pos = 0;
@@ -1647,15 +1819,26 @@ void notifyBridgeStatus();
 void connectWebSocket();
 
 bool loadWiFiCredentials() {
+    wifiSSID[0] = '\0';
+    wifiPass[0] = '\0';
+
     Preferences prefs;
-    prefs.begin("pigeon", true);
+    prefs.begin("pigeon", false);
     String ssid = prefs.getString("wifi_ssid", "");
-    String pass = prefs.getString("wifi_pass", "");
+    bool haveEncryptedPassword = loadEncryptedWiFiPassword(prefs, wifiPass, sizeof(wifiPass));
+    if (!haveEncryptedPassword && prefs.isKey(WIFI_PASS_LEGACY_KEY)) {
+        String legacyPass = prefs.getString(WIFI_PASS_LEGACY_KEY, "");
+        strncpy(wifiPass, legacyPass.c_str(), sizeof(wifiPass) - 1);
+        wifiPass[sizeof(wifiPass) - 1] = '\0';
+        if (!storeEncryptedWiFiPassword(prefs, wifiPass)) {
+            Serial.println("[WIFI] Failed to migrate encrypted password storage");
+        }
+    }
     prefs.end();
 
     if (ssid.length() > 0) {
         strncpy(wifiSSID, ssid.c_str(), sizeof(wifiSSID) - 1);
-        strncpy(wifiPass, pass.c_str(), sizeof(wifiPass) - 1);
+        wifiSSID[sizeof(wifiSSID) - 1] = '\0';
         wifiConfigured = true;
         return true;
     }
@@ -1666,11 +1849,16 @@ void saveWiFiCredentials(const char* ssid, const char* pass) {
     Preferences prefs;
     prefs.begin("pigeon", false);
     prefs.putString("wifi_ssid", ssid);
-    prefs.putString("wifi_pass", pass);
+    if (!storeEncryptedWiFiPassword(prefs, pass)) {
+        clearStoredWiFiPassword(prefs);
+        Serial.println("[WIFI] Failed to persist encrypted WiFi password");
+    }
     prefs.end();
 
     strncpy(wifiSSID, ssid, sizeof(wifiSSID) - 1);
     strncpy(wifiPass, pass, sizeof(wifiPass) - 1);
+    wifiSSID[sizeof(wifiSSID) - 1] = '\0';
+    wifiPass[sizeof(wifiPass) - 1] = '\0';
     wifiConfigured = true;
 }
 
@@ -1678,7 +1866,7 @@ void clearWiFiCredentials() {
     Preferences prefs;
     prefs.begin("pigeon", false);
     prefs.remove("wifi_ssid");
-    prefs.remove("wifi_pass");
+    clearStoredWiFiPassword(prefs);
     prefs.end();
 
     wifiSSID[0] = '\0';
@@ -1697,7 +1885,7 @@ void setupWiFi() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    Serial.printf("[WIFI] Connecting to '%s'...\n", wifiSSID);
+    Serial.println("[WIFI] Connecting to configured network...");
     WiFi.begin(wifiSSID, wifiPass);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     bridgeState = BRIDGE_CONNECTING;
@@ -1712,7 +1900,7 @@ void wifiLoop() {
     if (nowConnected && !wifiConnected) {
         wifiConnected = true;
         bridgeState = BRIDGE_WIFI_ONLY;
-        Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.println("[WIFI] Connected");
         connectWebSocket();
         notifyBridgeStatus();
     } else if (!nowConnected && wifiConnected) {
@@ -1726,7 +1914,7 @@ void wifiLoop() {
         uint32_t now = millis();
         if (now - lastWifiRetry >= WIFI_RETRY_MS) {
             lastWifiRetry = now;
-            Serial.printf("[WIFI] Retrying '%s'...\n", wifiSSID);
+            Serial.println("[WIFI] Retrying configured network...");
             WiFi.disconnect();
             WiFi.begin(wifiSSID, wifiPass);
         }
@@ -1753,7 +1941,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             break;
 
         case WStype_CONNECTED:
-            Serial.printf("[WS] Connected to %s\n", (char*)payload);
+            Serial.println("[WS] Connected to relay");
             wsConnected = true;
             wsReconnectDelay = 1000;
             bridgeState = BRIDGE_AUTH;
@@ -1802,8 +1990,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 void connectWebSocket() {
-    Serial.printf("[WS] Connecting to %s:%d%s\n", RELAY_HOST, RELAY_PORT, RELAY_PATH);
-    webSocket.begin(RELAY_HOST, RELAY_PORT, RELAY_PATH);
+    Serial.printf("[WS] Connecting to %s:%d%s over TLS\n", RELAY_HOST, RELAY_PORT, RELAY_PATH);
+    webSocket.beginSslWithCA(RELAY_HOST, RELAY_PORT, RELAY_PATH, RELAY_ROOT_CA);
     webSocket.onEvent(webSocketEvent);
     webSocket.setReconnectInterval(0);
     wsLastAttempt = millis();
@@ -2086,6 +2274,8 @@ void notifyBridgeStatus() {
         return;
     }
 
+    // iOS app expects ssid/ip fields in bridge_status for the WiFi Bridge UI.
+    // BLE is local/short-range so exposing these over BLE is acceptable.
     char json[128];
     if (bridgeState == BRIDGE_ONLINE) {
         snprintf(json, sizeof(json),
@@ -2107,7 +2297,12 @@ void notifyBridgeStatus() {
     pBridgeChar->setValue(json);
     pBridgeChar->notify();
     lastBridgeStatusNotify = millis();
-    Serial.printf("[BRIDGE] Notified: %s\n", json);
+    const char* stateStr =
+        (bridgeState == BRIDGE_ONLINE) ? "online" :
+        (bridgeState == BRIDGE_WIFI_ONLY || bridgeState == BRIDGE_AUTH) ? "wifi_connected" :
+        (bridgeState == BRIDGE_OFFLINE) ? "offline" :
+        (bridgeState == BRIDGE_NO_WIFI) ? "no_wifi" : "connecting";
+    Serial.printf("[BRIDGE] Notified bridge state: %s\n", stateStr);
 }
 
 // ============================================================================
@@ -2458,14 +2653,9 @@ void setup() {
     nextMsgID = (uint16_t)(esp_random() & 0xFFFF);
     nextFragGroupID = (uint16_t)(esp_random() & 0xFFFF);
 
-    char nodeStr[18];
-    macToStr(nodeAddr, nodeStr);
-
     Serial.println("=================================");
     Serial.println("  Pigeon Mesh Node");
-    Serial.printf("  MAC: %s\n", nodeStr);
     Serial.printf("  Pigeon ID: %s\n", nodePigeonID);
-    Serial.printf("  Public Key: %s\n", nodePublicKeyB64);
     Serial.println("=================================");
     Serial.println();
 

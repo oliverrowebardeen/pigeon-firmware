@@ -16,7 +16,7 @@ Nodes are equal peers. There's no coordinator, no routing table, no configuratio
 
 ### WiFi Bridge Mode
 
-When configured with WiFi credentials (via BLE), a node connects to the [pigeon-relay](https://github.com/oliverrowebardeen/pigeon-relay) server over WebSocket and bridges traffic between the local LoRa mesh and the internet. This lets phones reach each other across the internet through any bridge-enabled node.
+When configured with WiFi credentials (via BLE), a node stores the password encrypted in NVS, connects to the [pigeon-relay](https://github.com/oliverrowebardeen/pigeon-relay) server over `wss://`, and bridges traffic between the local LoRa mesh and the internet. This lets phones reach each other across the internet through any bridge-enabled node.
 
 ### Meshtastic Compatible Mode
 
