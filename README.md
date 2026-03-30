@@ -9,10 +9,25 @@ Firmware for Pigeon mesh network nodes. Each node is a self-contained LoRa + BLE
 A Pigeon mesh node does three things:
 
 1. **BLE GATT server** — An iPhone running [pigeon-ios](https://github.com/oliverrowebardeen/pigeon-ios) connects via Bluetooth and writes encrypted message blobs
-2. **LoRa mesh relay** — The node broadcasts those blobs over 915MHz LoRa and relays messages from other nodes (flood routing with TTL and deduplication)
+2. **LoRa mesh relay** — The node broadcasts those blobs over LoRa and relays messages from other nodes (flood routing with TTL and deduplication)
 3. **BLE notification** — When a LoRa message arrives, the node pushes it to any connected phone
 
 Nodes are equal peers. There's no coordinator, no routing table, no configuration. Plug one into USB power and it joins the mesh automatically.
+
+### WiFi Bridge Mode
+
+When configured with WiFi credentials (via BLE), a node connects to the [pigeon-relay](https://github.com/oliverrowebardeen/pigeon-relay) server over WebSocket and bridges traffic between the local LoRa mesh and the internet. This lets phones reach each other across the internet through any bridge-enabled node.
+
+### Meshtastic Compatible Mode
+
+Nodes support a second LoRa mode that speaks the [Meshtastic](https://meshtastic.org/) LongFast wire format. When enabled, stock Meshtastic devices relay Pigeon traffic transparently — every Meshtastic node in the field becomes part of the Pigeon mesh.
+
+- Pigeon envelopes are wrapped as protobuf `Data{portnum=256}` (PRIVATE_APP)
+- AES-128-CTR encryption with the default LongFast PSK
+- RSSI-based intelligent relay (closer nodes relay first, redundant rebroadcasts suppressed)
+- WiFi bridge is disabled in this mode
+- Switch modes via BLE: `{"lora_mode":"meshtastic"}` or `{"lora_mode":"native"}`
+- No Meshtastic GPL code — implemented from the public wire format spec
 
 ## Hardware
 
@@ -70,19 +85,37 @@ pio device monitor --port /dev/cu.usbmodemXXXX --baud 115200
 
 ## LoRa Configuration
 
-All parameters are configurable constants at the top of `src/pigeon.cpp`:
+The node supports two LoRa modes, selectable via BLE. The mode persists across reboots.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `LORA_FREQ` | 915.0 MHz | ISM band (US). Change for your region |
-| `LORA_BW` | 125.0 kHz | Bandwidth |
-| `LORA_SF` | 9 | Spreading factor (7-12). Higher = longer range, slower |
-| `LORA_CR` | 7 | Coding rate (5-8) |
-| `LORA_POWER` | 22 dBm | TX power (max for SX1262) |
-| `LORA_PREAMBLE` | 8 | Preamble length |
-| `DEFAULT_TTL` | 5 | Max relay hops per message |
+### Pigeon Native (default)
+
+| Parameter | Value |
+|-----------|-------|
+| Frequency | 915.0 MHz |
+| Bandwidth | 125.0 kHz |
+| Spreading Factor | 9 |
+| Coding Rate | 4/7 |
+| Sync Word | 0x12 |
+| Preamble | 8 symbols |
+| TX Power | 22 dBm |
+| Max Payload | ~2KB (fragmented) |
+
+### Meshtastic Compatible
+
+| Parameter | Value |
+|-----------|-------|
+| Frequency | 915.0 MHz |
+| Bandwidth | 250.0 kHz |
+| Spreading Factor | 11 |
+| Coding Rate | 4/5 |
+| Sync Word | 0x2B |
+| Preamble | 16 symbols |
+| TX Power | 22 dBm |
+| Max Payload | 233 bytes (single packet) |
 
 ## Mesh Protocol
+
+### Pigeon Native
 
 Each LoRa packet carries a mesh header:
 
@@ -94,6 +127,19 @@ Each LoRa packet carries a mesh header:
 - **Deduplication** — each node tracks recently seen (sender, msgID) pairs (64 entries, 30s expiry)
 - **TTL** — decremented on each relay hop, dropped at 0
 - **Fragmentation** — messages exceeding the 250-byte LoRa limit are split into fragments with a 4-byte fragment header: `[fragGroupID: 2B][fragIndex: 1B][fragTotal: 1B]`
+
+### Meshtastic Compatible
+
+Uses the standard Meshtastic 16-byte header (little-endian):
+
+```
+[to: 4B][from: 4B][id: 4B][flags: 1B][channel: 1B][nextHop: 1B][relayNode: 1B]
+```
+
+- **RSSI-based relay** — closer nodes relay with shorter delay (20-500ms), suppressing redundant rebroadcasts from farther nodes
+- **Deduplication** — separate dedup table keyed by (from, id)
+- **No fragmentation** — payloads must fit in a single 233-byte Meshtastic data slot
+- **Encrypted payload** — AES-128-CTR with the default LongFast PSK; header is plaintext
 
 ## BLE Protocol
 
@@ -121,19 +167,40 @@ The Identity characteristic returns JSON:
 
 ```json
 {
-  "publicKey": "<base64 32-byte key>",
+  "publicKey": "<base64 32-byte X25519 key>",
   "pigeonID": "<8 hex chars>",
   "displayName": "Pigeon Mesh Node",
   "isMeshNode": true,
-  "bridgeEnabled": false
+  "bridgeEnabled": false,
+  "relayReachable": false,
+  "bridgeProtocolVersion": 1,
+  "bridgeCapacityRemaining": 0,
+  "loraMode": "native"
 }
 ```
 
-The `publicKey` is a randomly generated 32-byte key persisted in NVS across reboots. The `pigeonID` is the first 4 bytes of SHA256(publicKey) as hex.
+- `publicKey` — X25519 public key, persisted in NVS across reboots
+- `pigeonID` — first 4 bytes of SHA-256(publicKey) as hex
+- `bridgeEnabled` — `true` if WiFi credentials are configured
+- `relayReachable` — `true` if the node has an authenticated WebSocket to the relay server
+- `loraMode` — `"native"` or `"meshtastic"`
+
+### Bridge Control
+
+Accepts JSON commands:
+
+| Command | Payload |
+|---------|---------|
+| Set WiFi | `{"ssid": "MyNetwork", "pass": "password123"}` |
+| Clear WiFi | `{"wifi": "off"}` |
+| Register phone | `{"type": "register", "pigeonID": "..."}` |
+| Switch LoRa mode | `{"lora_mode": "meshtastic"}` or `{"lora_mode": "native"}` |
+
+Sends notifications with bridge status updates and peer presence.
 
 ## Node Identity
 
-Each node derives its mesh address from the ESP32's hardware MAC address (6 bytes). The BLE identity uses a separate randomly generated key stored in flash. Both are stable across reboots.
+Each node derives its mesh address from the ESP32's hardware MAC address (6 bytes). The BLE identity uses a separately generated X25519 keypair stored in flash. Both are stable across reboots.
 
 ## Deployment
 
@@ -143,7 +210,7 @@ Nodes need only USB power (5V). No data connection to the host. Battery packs, p
 
 ```
 src/
-  pigeon.cpp   — Production firmware (BLE + LoRa mesh)
+  pigeon.cpp   — Production firmware (BLE + LoRa mesh + WiFi bridge)
   mesh.cpp     — Mesh-only firmware (no BLE, for testing)
   tx.cpp       — Transmitter test firmware
   rx.cpp       — Receiver test firmware
