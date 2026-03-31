@@ -28,6 +28,7 @@
 #include "curve25519-donna.h"
 #include <mbedtls/md.h>
 #include <mbedtls/aes.h>
+#include <mbedtls/gcm.h>
 
 // ============================================================================
 // Configuration
@@ -111,11 +112,11 @@ static const uint32_t LORA_REASM_TIMEOUT = 30000;
 // Chunk: [messageID:16][chunkIndex:2 BE][totalChunks:2 BE][payloadSize:2 BE][payload:0-480]
 static const size_t BLE_CHUNK_HEADER     = 22;
 static const size_t BLE_MAX_CHUNK_DATA   = 480;
-static const size_t BLE_REASM_SLOTS      = 4;
+static const size_t BLE_REASM_SLOTS      = 8;
 static const uint32_t BLE_REASM_TIMEOUT  = 30000;
 
 // --- BLE event queue (thread-safe BLE callback -> loop() handoff) ---
-static const size_t BLE_EVENT_QUEUE_LEN  = 8;
+static const size_t BLE_EVENT_QUEUE_LEN  = 64;
 static const size_t BLE_MAX_WRITE_SIZE   = 512;
 // --- BLE advertising watchdog ---
 static const uint32_t BLE_ADV_RESTART_MS = 5000;
@@ -229,6 +230,22 @@ struct BLEReasmSlot {
     bool active;
 };
 
+static const size_t BRIDGE_REASM_SLOTS = 2;
+static const size_t BRIDGE_MAX_MSG_SIZE = 8192;
+static const uint16_t BRIDGE_MAX_CHUNKS = 32;
+static const size_t BRIDGE_TUNNEL_CAPACITY = 1;
+
+struct BridgeReasmSlot {
+    uint8_t messageID[16];
+    uint16_t totalChunks;
+    uint16_t chunksReceived;
+    bool chunkPresent[BRIDGE_MAX_CHUNKS];
+    uint8_t data[BRIDGE_MAX_MSG_SIZE];
+    size_t chunkSizes[BRIDGE_MAX_CHUNKS];
+    uint32_t timestamp;
+    bool active;
+};
+
 // --- Meshtastic packet header (16 bytes, little-endian on wire) ---
 struct MshtHeader {
     uint32_t to;
@@ -282,6 +299,7 @@ uint16_t nextFragGroupID = 0;
 DedupEntry dedupTable[DEDUP_TABLE_SIZE];
 LoRaReasmSlot loraReasmTable[LORA_REASM_SLOTS];
 BLEReasmSlot bleReasmTable[BLE_REASM_SLOTS];
+BridgeReasmSlot bridgeReasmTable[BRIDGE_REASM_SLOTS];
 
 // Meshtastic mode globals
 static uint32_t mshtNodeNum = 0;
@@ -305,7 +323,7 @@ volatile uint32_t pendingNotifyStart = 0;
 static const uint32_t DEFERRED_NOTIFY_DELAY_MS = 500;
 
 // Queue for BLE->LoRa messages (phone wrote to us)
-static const size_t BLE_TX_QUEUE_SIZE = 4;
+static const size_t BLE_TX_QUEUE_SIZE = 8;
 struct BLETxItem {
     uint8_t data[MAX_LORA_MSG_SIZE];
     size_t len;
@@ -314,13 +332,24 @@ struct BLETxItem {
 BLETxItem bleTxQueue[BLE_TX_QUEUE_SIZE];
 
 // Queue for LoRa->BLE messages (received from mesh, send to phone)
-static const size_t LORA_RX_QUEUE_SIZE = 4;
+static const size_t LORA_RX_QUEUE_SIZE = 8;
 struct LoRaRxItem {
     uint8_t data[MAX_LORA_MSG_SIZE];
     size_t len;
     bool pending;
 };
 LoRaRxItem loraRxQueue[LORA_RX_QUEUE_SIZE];
+
+// Queue for relay outbound messages (BLE->relay when WS is temporarily down)
+static const size_t RELAY_OUT_QUEUE_SIZE = 8;
+static const uint32_t RELAY_QUEUE_EXPIRY_MS = 120000; // 2 minutes
+struct RelayQueueEntry {
+    uint8_t data[MAX_LORA_MSG_SIZE];
+    size_t len;
+    bool pending;
+    uint32_t timestamp;
+};
+RelayQueueEntry relayOutQueue[RELAY_OUT_QUEUE_SIZE];
 
 // BLE event queue and advertising watchdog
 static QueueHandle_t bleEventQueue = nullptr;
@@ -435,6 +464,7 @@ static const size_t WIFI_PASS_MAC_LEN = 16;
 
 // WebSocket state
 WebSocketsClient webSocket;
+WebSocketsClient bridgeTunnelSocket;
 static bool wsConnected = false;
 static bool wsAuthenticated = false;
 static uint32_t wsReconnectDelay = 1000;
@@ -453,6 +483,14 @@ struct MsgDedupEntry {
 };
 MsgDedupEntry msgDedupTable[MSG_DEDUP_SIZE];
 
+struct BridgeTunnelState {
+    bool active;
+    bool relayConnected;
+    char tunnelID[37];
+    uint8_t phonePublicKey[PUBKEY_LEN];
+};
+BridgeTunnelState bridgeTunnel = {};
+
 // ============================================================================
 // Utility functions
 // ============================================================================
@@ -470,6 +508,21 @@ void clearWiFiCredentials();
 void setupWiFi();
 void notifyBridgeStatus();
 void updateIdentityCharacteristic();
+void drainRelayQueue();
+void queueForRelay(const uint8_t* data, size_t len);
+void handleBridgeChunkWrite(const uint8_t* data, size_t len);
+void bridgeTunnelLoop();
+void closeBridgeTunnel(bool notifyPhone, const char* code, const char* reason);
+bool base64DecodeBuffer(const char* input, uint8_t* out, size_t outCap, size_t* outLen);
+bool deriveBridgeSymmetricKey(const uint8_t* peerPublicKey, uint8_t* outKey);
+bool aesGcmDecryptBuffer(const uint8_t* key,
+                         const uint8_t* nonce, size_t nonceLen,
+                         const uint8_t* ciphertext, size_t ciphertextLen,
+                         const uint8_t* tag, size_t tagLen,
+                         uint8_t* plaintext);
+void handleBridgeControlPayload(const uint8_t* plaintext,
+                                size_t plaintextLen,
+                                const uint8_t* senderPublicKey);
 
 void macToStr(const uint8_t* mac, char* buf) {
     snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -1258,9 +1311,6 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
         return;
     }
 
-    Serial.printf("[BLE RX] chunk %d/%d payloadSize=%d\n",
-                  chunkIndex + 1, totalChunks, payloadSize);
-
     // Find or create reassembly slot
     uint32_t now = millis();
     int slotIdx = -1;
@@ -1291,7 +1341,6 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
                     slotIdx = i;
                 }
             }
-            Serial.println("[BLE RX] Evicting oldest reassembly slot");
         }
         memset(&bleReasmTable[slotIdx], 0, sizeof(BLEReasmSlot));
         memcpy(bleReasmTable[slotIdx].messageID, msgID, 16);
@@ -1331,13 +1380,11 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
                 bleTxQueue[q].len = totalLen;
                 bleTxQueue[q].pending = true;
                 queued = true;
-                Serial.printf("[BLE RX] Complete message reassembled: %d bytes -> LoRa TX queue\n", totalLen);
                 break;
             }
         }
         if (!queued) {
-            // Keep slot active so next loop iteration can retry when a TX slot frees up
-            Serial.printf("[BLE RX] TX queue full, deferring %d byte message (will retry)\n", totalLen);
+            // Keep slot active so next loop iteration can retry when a TX slot frees up.
             return;
         }
         slot.active = false;
@@ -1348,11 +1395,169 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
 // Phone registration (phone identifies itself to the node)
 // ============================================================================
 
+void handleBridgeEnvelope(const uint8_t* data, size_t len) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, data, len);
+    if (err) {
+        Serial.printf("[BRIDGE TUNNEL] Envelope parse error: %s\n", err.c_str());
+        return;
+    }
+
+    const char* senderPublicKeyB64 = doc["senderPublicKey"];
+    const char* recipientPublicKeyB64 = doc["recipientPublicKey"];
+    const char* nonceB64 = doc["nonce"];
+    const char* ciphertextB64 = doc["ciphertext"];
+    const char* tagB64 = doc["tag"];
+    if (!senderPublicKeyB64 || !recipientPublicKeyB64 || !nonceB64 || !ciphertextB64 || !tagB64) {
+        return;
+    }
+
+    uint8_t senderPublicKey[PUBKEY_LEN];
+    uint8_t recipientPublicKey[PUBKEY_LEN];
+    uint8_t nonce[16];
+    uint8_t tag[16];
+    size_t senderLen = 0;
+    size_t recipientLen = 0;
+    size_t nonceLen = 0;
+    size_t tagLen = 0;
+
+    if (!base64DecodeBuffer(senderPublicKeyB64, senderPublicKey, sizeof(senderPublicKey), &senderLen) ||
+        !base64DecodeBuffer(recipientPublicKeyB64, recipientPublicKey, sizeof(recipientPublicKey), &recipientLen) ||
+        !base64DecodeBuffer(nonceB64, nonce, sizeof(nonce), &nonceLen) ||
+        !base64DecodeBuffer(tagB64, tag, sizeof(tag), &tagLen) ||
+        senderLen != PUBKEY_LEN ||
+        recipientLen != PUBKEY_LEN ||
+        tagLen != sizeof(tag)) {
+        return;
+    }
+
+    if (memcmp(recipientPublicKey, nodePublicKey, PUBKEY_LEN) != 0) {
+        return;
+    }
+
+    size_t ciphertextCap = strlen(ciphertextB64);
+    uint8_t* ciphertext = (uint8_t*)malloc(max((size_t)1, ciphertextCap));
+    if (!ciphertext) return;
+
+    size_t ciphertextLen = 0;
+    if (!base64DecodeBuffer(ciphertextB64, ciphertext, ciphertextCap, &ciphertextLen)) {
+        free(ciphertext);
+        return;
+    }
+
+    uint8_t symmetricKey[32];
+    if (!deriveBridgeSymmetricKey(senderPublicKey, symmetricKey)) {
+        free(ciphertext);
+        return;
+    }
+
+    uint8_t* plaintext = (uint8_t*)malloc(max((size_t)1, ciphertextLen + 1));
+    if (!plaintext) {
+        memset(symmetricKey, 0, sizeof(symmetricKey));
+        free(ciphertext);
+        return;
+    }
+
+    bool decrypted = aesGcmDecryptBuffer(
+        symmetricKey,
+        nonce,
+        nonceLen,
+        ciphertext,
+        ciphertextLen,
+        tag,
+        tagLen,
+        plaintext
+    );
+    memset(symmetricKey, 0, sizeof(symmetricKey));
+    free(ciphertext);
+
+    if (!decrypted) {
+        free(plaintext);
+        return;
+    }
+
+    plaintext[ciphertextLen] = '\0';
+    handleBridgeControlPayload(plaintext, ciphertextLen, senderPublicKey);
+    free(plaintext);
+}
+
+void handleBridgeChunkWrite(const uint8_t* data, size_t len) {
+    if (len < BLE_CHUNK_HEADER) return;
+
+    const uint8_t* msgID = data;
+    uint16_t chunkIndex = ((uint16_t)data[16] << 8) | data[17];
+    uint16_t totalChunks = ((uint16_t)data[18] << 8) | data[19];
+    uint16_t payloadSize = ((uint16_t)data[20] << 8) | data[21];
+    const uint8_t* payload = data + BLE_CHUNK_HEADER;
+
+    if (payloadSize > len - BLE_CHUNK_HEADER || totalChunks == 0 || totalChunks > BRIDGE_MAX_CHUNKS) {
+        return;
+    }
+
+    uint32_t now = millis();
+    int slotIdx = -1;
+    for (int i = 0; i < (int)BRIDGE_REASM_SLOTS; i++) {
+        if (bridgeReasmTable[i].active) {
+            if (now - bridgeReasmTable[i].timestamp > BLE_REASM_TIMEOUT) {
+                bridgeReasmTable[i].active = false;
+                continue;
+            }
+            if (memcmp(bridgeReasmTable[i].messageID, msgID, 16) == 0) {
+                slotIdx = i;
+                break;
+            }
+        }
+    }
+
+    if (slotIdx < 0) {
+        for (int i = 0; i < (int)BRIDGE_REASM_SLOTS; i++) {
+            if (!bridgeReasmTable[i].active) { slotIdx = i; break; }
+        }
+        if (slotIdx < 0) {
+            uint32_t oldest = UINT32_MAX;
+            slotIdx = 0;
+            for (int i = 0; i < (int)BRIDGE_REASM_SLOTS; i++) {
+                if (bridgeReasmTable[i].timestamp < oldest) {
+                    oldest = bridgeReasmTable[i].timestamp;
+                    slotIdx = i;
+                }
+            }
+        }
+
+        memset(&bridgeReasmTable[slotIdx], 0, sizeof(BridgeReasmSlot));
+        memcpy(bridgeReasmTable[slotIdx].messageID, msgID, 16);
+        bridgeReasmTable[slotIdx].totalChunks = totalChunks;
+        bridgeReasmTable[slotIdx].timestamp = now;
+        bridgeReasmTable[slotIdx].active = true;
+    }
+
+    BridgeReasmSlot& slot = bridgeReasmTable[slotIdx];
+    if (chunkIndex >= BRIDGE_MAX_CHUNKS || chunkIndex >= totalChunks) return;
+
+    if (!slot.chunkPresent[chunkIndex]) {
+        size_t offset = (size_t)chunkIndex * BLE_MAX_CHUNK_DATA;
+        if (offset + payloadSize > BRIDGE_MAX_MSG_SIZE) return;
+        memcpy(slot.data + offset, payload, payloadSize);
+        slot.chunkSizes[chunkIndex] = payloadSize;
+        slot.chunkPresent[chunkIndex] = true;
+        slot.chunksReceived++;
+    }
+
+    if (slot.chunksReceived >= slot.totalChunks) {
+        size_t totalLen = 0;
+        for (uint16_t i = 0; i < slot.totalChunks; i++) {
+            totalLen += slot.chunkSizes[i];
+        }
+        slot.active = false;
+        handleBridgeEnvelope(slot.data, totalLen);
+    }
+}
+
 void handleBridgeWrite(const uint8_t* data, size_t len) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, data, len);
     if (err) {
-        Serial.printf("[BRIDGE] JSON parse error: %s\n", err.c_str());
+        handleBridgeChunkWrite(data, len);
         return;
     }
 
@@ -1624,7 +1829,11 @@ bool hkdfSHA256(const uint8_t* salt, size_t saltLen,
     if (infoLen + 1 > sizeof(expandInput)) return false;
     memcpy(expandInput, info, infoLen);
     expandInput[infoLen] = 0x01;
-    if (mbedtls_md_hmac(md, prk, 32, expandInput, infoLen + 1, out) != 0) return false;
+    if (mbedtls_md_hmac(md, prk, 32, expandInput, infoLen + 1, out) != 0) {
+        memset(prk, 0, sizeof(prk));
+        return false;
+    }
+    memset(prk, 0, sizeof(prk));
     return true;
 }
 
@@ -1777,6 +1986,121 @@ bool parseUUID(const char* uuid, uint8_t* out) {
     return pos == 16;
 }
 
+void formatUUID(const uint8_t* bytes, char* out, size_t outLen) {
+    if (outLen < 37) return;
+    snprintf(out, outLen,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3],
+             bytes[4], bytes[5], bytes[6], bytes[7],
+             bytes[8], bytes[9], bytes[10], bytes[11],
+             bytes[12], bytes[13], bytes[14], bytes[15]);
+}
+
+void makeUUIDv4(uint8_t* out) {
+    esp_fill_random(out, 16);
+    out[6] = (out[6] & 0x0F) | 0x40;
+    out[8] = (out[8] & 0x3F) | 0x80;
+}
+
+String base64EncodeString(const uint8_t* data, size_t len) {
+    size_t outLen = 4 * ((len + 2) / 3) + 1;
+    char* out = (char*)malloc(outLen);
+    if (!out) return String();
+
+    size_t actual = 0;
+    if (mbedtls_base64_encode((unsigned char*)out, outLen, &actual, data, len) != 0) {
+        free(out);
+        return String();
+    }
+    out[actual] = '\0';
+    String encoded(out);
+    free(out);
+    return encoded;
+}
+
+bool base64DecodeBuffer(const char* input, uint8_t* out, size_t outCap, size_t* outLen) {
+    if (!input || !out || !outLen) return false;
+    return mbedtls_base64_decode(out, outCap, outLen,
+                                 (const unsigned char*)input, strlen(input)) == 0;
+}
+
+bool deriveBridgeSymmetricKey(const uint8_t* peerPublicKey, uint8_t* outKey) {
+    uint8_t sharedSecret[32];
+    curve25519_donna(sharedSecret, nodePrivateKey, peerPublicKey);
+
+    uint8_t zero[32] = {0};
+    if (memcmp(sharedSecret, zero, sizeof(sharedSecret)) == 0) {
+        return false;
+    }
+
+    const char* salt = "Pigeon-HKDF-Salt-v1";
+    const char* info = "Pigeon-MVP-E2E";
+    bool ok = hkdfSHA256(
+        (const uint8_t*)salt, strlen(salt),
+        sharedSecret, sizeof(sharedSecret),
+        (const uint8_t*)info, strlen(info),
+        outKey, 32
+    );
+    memset(sharedSecret, 0, sizeof(sharedSecret));
+    return ok;
+}
+
+bool aesGcmEncryptBuffer(const uint8_t* key,
+                         const uint8_t* nonce, size_t nonceLen,
+                         const uint8_t* plaintext, size_t plaintextLen,
+                         uint8_t* ciphertext, uint8_t* tag) {
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+
+    int rc = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (rc == 0) {
+        rc = mbedtls_gcm_crypt_and_tag(
+            &ctx,
+            MBEDTLS_GCM_ENCRYPT,
+            plaintextLen,
+            nonce,
+            nonceLen,
+            nullptr,
+            0,
+            plaintext,
+            ciphertext,
+            16,
+            tag
+        );
+    }
+
+    mbedtls_gcm_free(&ctx);
+    return rc == 0;
+}
+
+bool aesGcmDecryptBuffer(const uint8_t* key,
+                         const uint8_t* nonce, size_t nonceLen,
+                         const uint8_t* ciphertext, size_t ciphertextLen,
+                         const uint8_t* tag, size_t tagLen,
+                         uint8_t* plaintext) {
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+
+    int rc = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (rc == 0) {
+        rc = mbedtls_gcm_auth_decrypt(
+            &ctx,
+            ciphertextLen,
+            nonce,
+            nonceLen,
+            nullptr,
+            0,
+            tag,
+            tagLen,
+            ciphertext,
+            plaintext
+        );
+    }
+
+    mbedtls_gcm_free(&ctx);
+    return rc == 0;
+}
+
 // ============================================================================
 // Message-level dedup (internet<->LoRa bridging)
 // ============================================================================
@@ -1873,6 +2197,7 @@ void clearWiFiCredentials() {
     wifiPass[0] = '\0';
     wifiConfigured = false;
     wifiConnected = false;
+    closeBridgeTunnel(false, "bridge_unavailable", "bridge unavailable");
     bridgeState = BRIDGE_NO_WIFI;
 }
 
@@ -1885,7 +2210,7 @@ void setupWiFi() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    Serial.println("[WIFI] Connecting to configured network...");
+    Serial.println("[WIFI] Connecting...");
     WiFi.begin(wifiSSID, wifiPass);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     bridgeState = BRIDGE_CONNECTING;
@@ -1907,6 +2232,7 @@ void wifiLoop() {
         wifiConnected = false;
         wsConnected = false;
         wsAuthenticated = false;
+        closeBridgeTunnel(false, "bridge_unavailable", "bridge unavailable");
         bridgeState = BRIDGE_CONNECTING;
         Serial.println("[WIFI] Connection lost, will auto-reconnect");
         notifyBridgeStatus();
@@ -1914,7 +2240,7 @@ void wifiLoop() {
         uint32_t now = millis();
         if (now - lastWifiRetry >= WIFI_RETRY_MS) {
             lastWifiRetry = now;
-            Serial.println("[WIFI] Retrying configured network...");
+            Serial.println("[WIFI] Retrying...");
             WiFi.disconnect();
             WiFi.begin(wifiSSID, wifiPass);
         }
@@ -1927,6 +2253,7 @@ void wifiLoop() {
 
 // Forward declarations
 void sendAuthHello();
+void sendRelayPong();
 void handleAuthChallenge(JsonDocument& doc);
 void handleMsgDeliver(JsonDocument& doc);
 
@@ -1966,16 +2293,26 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 wsAuthenticated = true;
                 bridgeState = BRIDGE_ONLINE;
                 notifyBridgeStatus();
+                drainRelayQueue();
             } else if (strcmp(msgType, "auth_error") == 0) {
                 Serial.printf("[AUTH] Auth failed: %s\n",
                     doc["payload"]["reason"] | "unknown");
                 wsReconnectDelay = WS_MAX_BACKOFF;
                 webSocket.disconnect();
+            } else if (strcmp(msgType, "msg_accepted") == 0) {
+                Serial.printf("[BRIDGE] Relay accepted message: %s\n",
+                    doc["payload"]["message_id"] | "?");
             } else if (strcmp(msgType, "msg_deliver") == 0) {
                 handleMsgDeliver(doc);
             } else if (strcmp(msgType, "msg_dup") == 0) {
                 Serial.printf("[BRIDGE] Server deduped message: %s\n",
                     doc["payload"]["message_id"] | "?");
+            } else if (strcmp(msgType, "ping") == 0) {
+                sendRelayPong();
+            } else if (strcmp(msgType, "error") == 0) {
+                Serial.printf("[BRIDGE] Relay error: code=%s message=%s\n",
+                    doc["payload"]["code"] | "?",
+                    doc["payload"]["message"] | "?");
             }
             break;
         }
@@ -2019,82 +2356,94 @@ void wsLoop() {
 void sendAuthHello() {
     char json[128];
     snprintf(json, sizeof(json),
-        "{\"type\":\"auth_hello\",\"payload\":{\"public_key_b64\":\"%s\"}}",
+        "{\"type\":\"auth_hello\",\"payload\":{\"client_pubkey_b64\":\"%s\"}}",
         nodePublicKeyB64);
     webSocket.sendTXT(json);
     Serial.println("[AUTH] Sent auth_hello");
 }
 
+void sendRelayPong() {
+    webSocket.sendTXT("{\"type\":\"pong\",\"payload\":{}}");
+}
+
 void handleAuthChallenge(JsonDocument& doc) {
-    const char* ephPubB64 = doc["payload"]["ephemeral_public_key_b64"];
+    const char* serverPubB64 = doc["payload"]["server_pubkey_b64"];
     const char* nonceB64 = doc["payload"]["nonce_b64"];
     const char* challengeId = doc["payload"]["challenge_id"];
-    int64_t issuedAt = doc["payload"]["issued_at"];
+    int64_t issuedAtMs = doc["payload"]["issued_at_ms"];
 
-    if (!ephPubB64 || !nonceB64 || !challengeId) {
+    if (!serverPubB64 || !nonceB64 || !challengeId) {
         Serial.println("[AUTH] Invalid auth_challenge: missing fields");
+        Serial.printf("[AUTH]   server_pubkey_b64=%s nonce_b64=%s challenge_id=%s\n",
+            serverPubB64 ? "ok" : "MISSING",
+            nonceB64 ? "ok" : "MISSING",
+            challengeId ? "ok" : "MISSING");
         return;
     }
 
-    uint8_t serverEphPub[32];
+    // Decode server ephemeral public key (32 bytes)
+    uint8_t serverPub[32];
     size_t decoded = 0;
-    mbedtls_base64_decode(serverEphPub, 32, &decoded,
-                          (const unsigned char*)ephPubB64, strlen(ephPubB64));
+    mbedtls_base64_decode(serverPub, 32, &decoded,
+                          (const unsigned char*)serverPubB64, strlen(serverPubB64));
     if (decoded != 32) {
-        Serial.println("[AUTH] Invalid ephemeral public key length");
+        Serial.printf("[AUTH] Invalid server public key length: %d\n", (int)decoded);
         return;
     }
 
-    uint8_t nonce[32];
-    mbedtls_base64_decode(nonce, 32, &decoded,
+    // Decode nonce (server sends 16 bytes)
+    uint8_t nonce[16];
+    mbedtls_base64_decode(nonce, 16, &decoded,
                           (const unsigned char*)nonceB64, strlen(nonceB64));
-    if (decoded != 32) {
-        Serial.println("[AUTH] Invalid nonce length");
+    if (decoded == 0 || decoded > 16) {
+        Serial.printf("[AUTH] Invalid nonce length: %d\n", (int)decoded);
         return;
     }
-
-    uint8_t challengeIdBytes[16];
-    if (!parseUUID(challengeId, challengeIdBytes)) {
-        Serial.println("[AUTH] Invalid challenge_id UUID");
-        return;
-    }
+    size_t nonceLen = decoded;
 
     // X25519 ECDH
     uint8_t sharedSecret[32];
-    curve25519_donna(sharedSecret, nodePrivateKey, serverEphPub);
+    curve25519_donna(sharedSecret, nodePrivateKey, serverPub);
 
     // RFC 7748 section 6.1: abort if shared secret is all-zero
     uint8_t zero[32] = {0};
     if (memcmp(sharedSecret, zero, 32) == 0) {
         Serial.println("[AUTH] ECDH produced zero shared secret — aborting");
+        memset(sharedSecret, 0, sizeof(sharedSecret));
         webSocket.disconnect();
         return;
     }
 
-    // HKDF-SHA256
+    // HKDF-SHA256 — info = challenge_id_string + nonce + client_pubkey
     const char* salt = "pigeon-relay-auth-v1";
-    uint8_t info[80]; // 16 + 32 + 32
-    memcpy(info, challengeIdBytes, 16);
-    memcpy(info + 16, nonce, 32);
-    memcpy(info + 48, nodePublicKey, 32);
+    size_t cidLen = strlen(challengeId);
+    size_t infoLen = cidLen + nonceLen + 32;
+    uint8_t info[128]; // 36 (UUID string) + 16 (nonce) + 32 (pubkey) = 84
+    memcpy(info, challengeId, cidLen);
+    memcpy(info + cidLen, nonce, nonceLen);
+    memcpy(info + cidLen + nonceLen, nodePublicKey, 32);
 
     uint8_t authKey[32];
     if (!hkdfSHA256((const uint8_t*)salt, strlen(salt),
-                    sharedSecret, 32, info, 80, authKey, 32)) {
+                    sharedSecret, 32, info, infoLen, authKey, 32)) {
         Serial.println("[AUTH] HKDF failed");
+        memset(sharedSecret, 0, sizeof(sharedSecret));
         return;
     }
 
-    // HMAC-SHA256
-    uint8_t hmacInput[24]; // 16 + 8
-    memcpy(hmacInput, challengeIdBytes, 16);
+    // HMAC-SHA256 — input = challenge_id_string + issued_at_ms (8 bytes big-endian)
+    size_t hmacLen = cidLen + 8;
+    uint8_t hmacInput[128]; // 36 + 8 = 44
+    memcpy(hmacInput, challengeId, cidLen);
     for (int i = 7; i >= 0; i--) {
-        hmacInput[16 + (7 - i)] = (uint8_t)(issuedAt >> (i * 8));
+        hmacInput[cidLen + (7 - i)] = (uint8_t)(issuedAtMs >> (i * 8));
     }
 
     uint8_t proof[32];
-    if (!hmacSHA256(authKey, 32, hmacInput, 24, proof)) {
+    if (!hmacSHA256(authKey, 32, hmacInput, hmacLen, proof)) {
         Serial.println("[AUTH] HMAC failed");
+        memset(sharedSecret, 0, sizeof(sharedSecret));
+        memset(authKey, 0, sizeof(authKey));
         return;
     }
 
@@ -2110,22 +2459,111 @@ void handleAuthChallenge(JsonDocument& doc) {
         challengeId, proofB64);
     webSocket.sendTXT(json);
     Serial.println("[AUTH] Sent auth_prove");
+
+    memset(sharedSecret, 0, sizeof(sharedSecret));
+    memset(authKey, 0, sizeof(authKey));
 }
 
 // ============================================================================
 // Message bridging
 // ============================================================================
 
-void bridgeToRelay(const uint8_t* data, size_t len) {
-    if (!wsAuthenticated || len < ROUTING_HEADER_SIZE) return;
+void queueForRelay(const uint8_t* data, size_t len) {
+    uint32_t now = millis();
+    // Find free or expired slot, or evict oldest
+    int slot = -1;
+    uint32_t oldest = UINT32_MAX;
+    int oldestIdx = 0;
+    for (int i = 0; i < (int)RELAY_OUT_QUEUE_SIZE; i++) {
+        if (!relayOutQueue[i].pending || (now - relayOutQueue[i].timestamp > RELAY_QUEUE_EXPIRY_MS)) {
+            slot = i;
+            break;
+        }
+        if (relayOutQueue[i].timestamp < oldest) {
+            oldest = relayOutQueue[i].timestamp;
+            oldestIdx = i;
+        }
+    }
+    if (slot < 0) slot = oldestIdx; // evict oldest
+    memcpy(relayOutQueue[slot].data, data, len);
+    relayOutQueue[slot].len = len;
+    relayOutQueue[slot].pending = true;
+    relayOutQueue[slot].timestamp = now;
+    Serial.printf("[BRIDGE] Queued for relay (slot %d, %d bytes) — will send when WS reconnects\n", slot, (int)len);
+}
 
-    const uint8_t* msgIdBytes = data;
-    const uint8_t* recipientHash = data + 16;
-    const uint8_t* envelope = data + ROUTING_HEADER_SIZE;
-    size_t envelopeLen = len - ROUTING_HEADER_SIZE;
+void bridgeToRelay(const uint8_t* data, size_t len) {
+    Serial.printf("[BRIDGE] bridgeToRelay called: len=%d wsAuth=%d\n", (int)len, wsAuthenticated);
+
+    const uint8_t* msgIdBytes = nullptr;
+    const uint8_t* recipientHash = nullptr;
+    const uint8_t* envelope = data;
+    size_t envelopeLen = len;
+
+    uint8_t parsedMsgId[16];
+    uint8_t parsedRecipientHash[32];
+    bool usedEnvelopeFallback = false;
+
+    if (len >= ROUTING_HEADER_SIZE && data[ROUTING_HEADER_SIZE] == '{') {
+        msgIdBytes = data;
+        recipientHash = data + 16;
+        envelope = data + ROUTING_HEADER_SIZE;
+        envelopeLen = len - ROUTING_HEADER_SIZE;
+    } else {
+        JsonDocument envelopeDoc;
+        DeserializationError err = deserializeJson(envelopeDoc, data, len);
+        if (err) {
+            if (len < ROUTING_HEADER_SIZE) {
+                Serial.printf("[BRIDGE] DROPPED: len=%d < ROUTING_HEADER_SIZE=%d and envelope parse failed: %s\n",
+                              (int)len, (int)ROUTING_HEADER_SIZE, err.c_str());
+            } else {
+                Serial.printf("[BRIDGE] DROPPED: payload missing routed envelope at offset %d (byte=0x%02x) and envelope parse failed: %s\n",
+                              (int)ROUTING_HEADER_SIZE, data[ROUTING_HEADER_SIZE], err.c_str());
+            }
+            return;
+        }
+
+        const char* msgIdStr = envelopeDoc["id"];
+        const char* recipientPublicKeyB64 = envelopeDoc["recipientPublicKey"];
+        if (!msgIdStr || !recipientPublicKeyB64) {
+            Serial.println("[BRIDGE] DROPPED: raw envelope missing relay metadata");
+            return;
+        }
+
+        if (!parseUUID(msgIdStr, parsedMsgId)) {
+            Serial.printf("[BRIDGE] DROPPED: invalid envelope UUID '%s'\n", msgIdStr);
+            return;
+        }
+
+        uint8_t recipientPublicKey[PUBKEY_LEN];
+        size_t recipientPublicKeyLen = 0;
+        if (!base64DecodeBuffer(
+                recipientPublicKeyB64,
+                recipientPublicKey,
+                sizeof(recipientPublicKey),
+                &recipientPublicKeyLen
+            ) || recipientPublicKeyLen != PUBKEY_LEN) {
+            Serial.println("[BRIDGE] DROPPED: invalid raw envelope recipient public key");
+            return;
+        }
+
+        mbedtls_sha256(recipientPublicKey, PUBKEY_LEN, parsedRecipientHash, 0);
+        msgIdBytes = parsedMsgId;
+        recipientHash = parsedRecipientHash;
+        usedEnvelopeFallback = true;
+    }
+
+    if (!wsAuthenticated) {
+        Serial.println("[BRIDGE] WS not authenticated — queueing for retry");
+        queueForRelay(data, len);
+        return;
+    }
 
     // Don't re-bridge messages we received from the internet
-    if (isMsgDuplicate(msgIdBytes)) return;
+    if (isMsgDuplicate(msgIdBytes)) {
+        Serial.println("[BRIDGE] DROPPED: duplicate message");
+        return;
+    }
 
     char msgIdStr[37];
     snprintf(msgIdStr, sizeof(msgIdStr),
@@ -2164,23 +2602,393 @@ void bridgeToRelay(const uint8_t* data, size_t len) {
         msgIdStr, recipientHex, envelopeB64);
 
     webSocket.sendTXT(json);
-    Serial.printf("[BRIDGE] LoRa->Relay: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+    if (usedEnvelopeFallback) {
+        Serial.printf("[BRIDGE] Envelope->Relay fallback: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+    } else {
+        Serial.printf("[BRIDGE] LoRa->Relay: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+    }
 
     free(envelopeB64);
     free(json);
 }
 
-void handleMsgDeliver(JsonDocument& doc) {
-    const char* msgIdStr = doc["payload"]["message_id"];
-    const char* recipientHashHex = doc["payload"]["recipient_hash_hex"];
-    const char* envelopeB64 = doc["payload"]["envelope_b64"];
+void drainRelayQueue() {
+    if (!wsAuthenticated) return;
+    for (int i = 0; i < (int)RELAY_OUT_QUEUE_SIZE; i++) {
+        if (relayOutQueue[i].pending) {
+            uint32_t age = millis() - relayOutQueue[i].timestamp;
+            if (age > RELAY_QUEUE_EXPIRY_MS) {
+                Serial.printf("[BRIDGE] Relay queue slot %d expired (%d ms old)\n", i, (int)age);
+                relayOutQueue[i].pending = false;
+                continue;
+            }
+            Serial.printf("[BRIDGE] Draining relay queue slot %d (%d bytes, %d ms old)\n",
+                          i, (int)relayOutQueue[i].len, (int)age);
+            bridgeToRelay(relayOutQueue[i].data, relayOutQueue[i].len);
+            relayOutQueue[i].pending = false;
+        }
+    }
+}
 
-    if (!msgIdStr || !recipientHashHex || !envelopeB64) {
-        Serial.println("[BRIDGE] Invalid msg_deliver: missing fields");
+size_t currentBridgeCapacityRemaining() {
+    return (bridgeState == BRIDGE_ONLINE) ? BRIDGE_TUNNEL_CAPACITY : 0;
+}
+
+bool sendEncryptedBridgeFrame(const String& plaintext, const uint8_t* recipientPublicKey) {
+    if (!pBridgeChar || !bleClientConnected) return false;
+
+    uint8_t symmetricKey[32];
+    if (!deriveBridgeSymmetricKey(recipientPublicKey, symmetricKey)) {
+        return false;
+    }
+
+    uint8_t nonce[12];
+    esp_fill_random(nonce, sizeof(nonce));
+
+    size_t plaintextLen = plaintext.length();
+    uint8_t* ciphertext = (uint8_t*)malloc(max((size_t)1, plaintextLen));
+    uint8_t tag[16];
+    if (!ciphertext) return false;
+
+    bool encrypted = aesGcmEncryptBuffer(
+        symmetricKey,
+        nonce,
+        sizeof(nonce),
+        (const uint8_t*)plaintext.c_str(),
+        plaintextLen,
+        ciphertext,
+        tag
+    );
+    memset(symmetricKey, 0, sizeof(symmetricKey));
+    if (!encrypted) {
+        free(ciphertext);
+        return false;
+    }
+
+    uint8_t uuidBytes[16];
+    makeUUIDv4(uuidBytes);
+    char uuidStr[37];
+    formatUUID(uuidBytes, uuidStr, sizeof(uuidStr));
+
+    JsonDocument envelopeDoc;
+    envelopeDoc["id"] = uuidStr;
+    envelopeDoc["senderPublicKey"] = nodePublicKeyB64;
+    envelopeDoc["recipientPublicKey"] = base64EncodeString(recipientPublicKey, PUBKEY_LEN);
+    envelopeDoc["timestamp"] = (int64_t)millis();
+    envelopeDoc["nonce"] = base64EncodeString(nonce, sizeof(nonce));
+    envelopeDoc["ciphertext"] = base64EncodeString(ciphertext, plaintextLen);
+    envelopeDoc["tag"] = base64EncodeString(tag, sizeof(tag));
+    envelopeDoc["hopCount"] = 0;
+    envelopeDoc["ttl"] = DEFAULT_TTL;
+    free(ciphertext);
+
+    String envelopeJson;
+    serializeJson(envelopeDoc, envelopeJson);
+    bleSendChunked(pBridgeChar, (const uint8_t*)envelopeJson.c_str(), envelopeJson.length());
+    return true;
+}
+
+void sendBridgeTunnelOpened(const char* tunnelID, const uint8_t* recipientPublicKey) {
+    JsonDocument doc;
+    doc["type"] = "tunnel_opened";
+    doc["tunnel_id"] = tunnelID;
+    JsonObject payload = doc["payload"].to<JsonObject>();
+    payload["tunnel_id"] = tunnelID;
+
+    String plaintext;
+    serializeJson(doc, plaintext);
+    sendEncryptedBridgeFrame(plaintext, recipientPublicKey);
+}
+
+void sendBridgeTunnelCloseFrame(const char* tunnelID,
+                                const uint8_t* recipientPublicKey,
+                                const char* code,
+                                const char* reason) {
+    JsonDocument doc;
+    doc["type"] = "tunnel_close";
+    doc["tunnel_id"] = tunnelID;
+    JsonObject payload = doc["payload"].to<JsonObject>();
+    payload["tunnel_id"] = tunnelID;
+    payload["code"] = code;
+    if (reason && reason[0]) {
+        payload["reason"] = reason;
+    }
+
+    String plaintext;
+    serializeJson(doc, plaintext);
+    sendEncryptedBridgeFrame(plaintext, recipientPublicKey);
+}
+
+void sendBridgeTunnelErrorFrame(const char* tunnelID,
+                                const uint8_t* recipientPublicKey,
+                                const char* code,
+                                const char* message) {
+    JsonDocument doc;
+    doc["type"] = "tunnel_error";
+    if (tunnelID && tunnelID[0]) {
+        doc["tunnel_id"] = tunnelID;
+    }
+    JsonObject payload = doc["payload"].to<JsonObject>();
+    if (tunnelID && tunnelID[0]) {
+        payload["tunnel_id"] = tunnelID;
+    }
+    payload["code"] = code;
+    payload["message"] = message;
+
+    String plaintext;
+    serializeJson(doc, plaintext);
+    sendEncryptedBridgeFrame(plaintext, recipientPublicKey);
+}
+
+void sendBridgeTunnelDataFrame(const char* tunnelID,
+                               const uint8_t* recipientPublicKey,
+                               const uint8_t* text,
+                               size_t textLen) {
+    JsonDocument doc;
+    doc["type"] = "tunnel_data";
+    doc["tunnel_id"] = tunnelID;
+    JsonObject payload = doc["payload"].to<JsonObject>();
+    payload["tunnel_id"] = tunnelID;
+    payload["payload_b64"] = base64EncodeString(text, textLen);
+
+    String plaintext;
+    serializeJson(doc, plaintext);
+    sendEncryptedBridgeFrame(plaintext, recipientPublicKey);
+}
+
+void sendBridgePongFrame(const uint8_t* recipientPublicKey) {
+    JsonDocument doc;
+    doc["type"] = "pong";
+    doc["payload"].to<JsonObject>();
+
+    String plaintext;
+    serializeJson(doc, plaintext);
+    sendEncryptedBridgeFrame(plaintext, recipientPublicKey);
+}
+
+void resetBridgeTunnelState() {
+    bridgeTunnel.active = false;
+    bridgeTunnel.relayConnected = false;
+    bridgeTunnel.tunnelID[0] = '\0';
+    memset(bridgeTunnel.phonePublicKey, 0, sizeof(bridgeTunnel.phonePublicKey));
+}
+
+void bridgeTunnelWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_CONNECTED:
+            if (!bridgeTunnel.active) break;
+            bridgeTunnel.relayConnected = true;
+            sendBridgeTunnelOpened(bridgeTunnel.tunnelID, bridgeTunnel.phonePublicKey);
+            Serial.printf("[BRIDGE TUNNEL] Opened relay tunnel %s\n", bridgeTunnel.tunnelID);
+            break;
+
+        case WStype_TEXT:
+            if (!bridgeTunnel.active || !bridgeTunnel.relayConnected) break;
+            sendBridgeTunnelDataFrame(
+                bridgeTunnel.tunnelID,
+                bridgeTunnel.phonePublicKey,
+                payload,
+                length
+            );
+            break;
+
+        case WStype_DISCONNECTED: {
+            if (!bridgeTunnel.active) break;
+
+            Serial.printf("[BRIDGE TUNNEL] Disconnected tunnel %s (connected=%d)\n",
+                          bridgeTunnel.tunnelID,
+                          bridgeTunnel.relayConnected ? 1 : 0);
+
+            char tunnelID[37];
+            uint8_t phonePublicKey[PUBKEY_LEN];
+            strncpy(tunnelID, bridgeTunnel.tunnelID, sizeof(tunnelID));
+            tunnelID[sizeof(tunnelID) - 1] = '\0';
+            memcpy(phonePublicKey, bridgeTunnel.phonePublicKey, sizeof(phonePublicKey));
+            bool wasConnected = bridgeTunnel.relayConnected;
+
+            resetBridgeTunnelState();
+            notifyBridgeStatus();
+
+            if (wasConnected) {
+                sendBridgeTunnelCloseFrame(
+                    tunnelID,
+                    phonePublicKey,
+                    "relay_closed",
+                    "relay transport closed"
+                );
+            } else {
+                sendBridgeTunnelErrorFrame(
+                    tunnelID,
+                    phonePublicKey,
+                    "relay_connect_failed",
+                    "failed to open relay tunnel"
+                );
+            }
+            break;
+        }
+
+        case WStype_PING:
+        case WStype_PONG:
+        default:
+            break;
+    }
+}
+
+void closeBridgeTunnel(bool notifyPhone, const char* code, const char* reason) {
+    if (!bridgeTunnel.active) return;
+
+    char tunnelID[37];
+    uint8_t phonePublicKey[PUBKEY_LEN];
+    strncpy(tunnelID, bridgeTunnel.tunnelID, sizeof(tunnelID));
+    tunnelID[sizeof(tunnelID) - 1] = '\0';
+    memcpy(phonePublicKey, bridgeTunnel.phonePublicKey, sizeof(phonePublicKey));
+
+    resetBridgeTunnelState();
+    bridgeTunnelSocket.disconnect();
+    notifyBridgeStatus();
+
+    if (notifyPhone) {
+        sendBridgeTunnelCloseFrame(tunnelID, phonePublicKey, code, reason);
+    }
+}
+
+void openBridgeTunnel(const char* tunnelID, const uint8_t* phonePublicKey) {
+    if (!tunnelID || !phonePublicKey) return;
+
+    if (bridgeState != BRIDGE_ONLINE) {
+        sendBridgeTunnelErrorFrame(
+            tunnelID,
+            phonePublicKey,
+            "bridge_unavailable",
+            "bridge unavailable"
+        );
         return;
     }
-    if (strlen(recipientHashHex) != 64) {
-        Serial.println("[BRIDGE] Invalid recipient_hash_hex length");
+
+    if (bridgeTunnel.active) {
+        sendBridgeTunnelErrorFrame(
+            tunnelID,
+            phonePublicKey,
+            "capacity_reached",
+            "bridge capacity reached"
+        );
+        return;
+    }
+
+    bridgeTunnelSocket.disconnect();
+    bridgeTunnelSocket.beginSslWithCA(RELAY_HOST, RELAY_PORT, RELAY_PATH, RELAY_ROOT_CA);
+    bridgeTunnelSocket.onEvent(bridgeTunnelWebSocketEvent);
+    bridgeTunnelSocket.setReconnectInterval(0);
+
+    strncpy(bridgeTunnel.tunnelID, tunnelID, sizeof(bridgeTunnel.tunnelID));
+    bridgeTunnel.tunnelID[sizeof(bridgeTunnel.tunnelID) - 1] = '\0';
+    memcpy(bridgeTunnel.phonePublicKey, phonePublicKey, sizeof(bridgeTunnel.phonePublicKey));
+    bridgeTunnel.active = true;
+    bridgeTunnel.relayConnected = false;
+
+    notifyBridgeStatus();
+    Serial.printf("[BRIDGE TUNNEL] Opening relay tunnel %s\n", bridgeTunnel.tunnelID);
+}
+
+void handleBridgeControlPayload(const uint8_t* plaintext,
+                                size_t plaintextLen,
+                                const uint8_t* senderPublicKey) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, plaintext, plaintextLen);
+    if (err) {
+        Serial.printf("[BRIDGE TUNNEL] Frame JSON parse error: %s\n", err.c_str());
+        return;
+    }
+
+    const char* type = doc["type"];
+    const char* topLevelTunnelID = doc["tunnel_id"];
+    if (!type) return;
+
+    if (strcmp(type, "tunnel_open") == 0) {
+        const char* tunnelID = doc["payload"]["tunnel_id"] | topLevelTunnelID;
+        openBridgeTunnel(tunnelID, senderPublicKey);
+        return;
+    }
+
+    if (strcmp(type, "tunnel_data") == 0) {
+        const char* tunnelID = doc["payload"]["tunnel_id"] | topLevelTunnelID;
+        const char* payloadB64 = doc["payload"]["payload_b64"];
+        if (!tunnelID || !payloadB64) {
+            sendBridgeTunnelErrorFrame(
+                topLevelTunnelID,
+                senderPublicKey,
+                "bad_payload",
+                "invalid tunnel data"
+            );
+            return;
+        }
+
+        if (!bridgeTunnel.active ||
+            strcmp(bridgeTunnel.tunnelID, tunnelID) != 0 ||
+            memcmp(bridgeTunnel.phonePublicKey, senderPublicKey, PUBKEY_LEN) != 0 ||
+            !bridgeTunnel.relayConnected) {
+            sendBridgeTunnelErrorFrame(
+                tunnelID,
+                senderPublicKey,
+                "unknown_tunnel",
+                "unknown tunnel"
+            );
+            return;
+        }
+
+        size_t decodedCap = strlen(payloadB64) + 1;
+        uint8_t* decoded = (uint8_t*)malloc(decodedCap);
+        if (!decoded) return;
+
+        size_t decodedLen = 0;
+        bool ok = base64DecodeBuffer(payloadB64, decoded, decodedCap - 1, &decodedLen);
+        if (!ok) {
+            free(decoded);
+            sendBridgeTunnelErrorFrame(
+                tunnelID,
+                senderPublicKey,
+                "bad_payload",
+                "invalid tunnel data"
+            );
+            return;
+        }
+
+        decoded[decodedLen] = '\0';
+        bridgeTunnelSocket.sendTXT((const char*)decoded);
+        free(decoded);
+        return;
+    }
+
+    if (strcmp(type, "tunnel_close") == 0) {
+        const char* tunnelID = doc["payload"]["tunnel_id"] | topLevelTunnelID;
+        const char* code = doc["payload"]["code"] | "client_closed";
+        const char* reason = doc["payload"]["reason"] | "transport stopped";
+
+        if (bridgeTunnel.active &&
+            tunnelID &&
+            strcmp(bridgeTunnel.tunnelID, tunnelID) == 0 &&
+            memcmp(bridgeTunnel.phonePublicKey, senderPublicKey, PUBKEY_LEN) == 0) {
+            closeBridgeTunnel(true, code, reason);
+        }
+        return;
+    }
+
+    if (strcmp(type, "ping") == 0) {
+        sendBridgePongFrame(senderPublicKey);
+    }
+}
+
+void bridgeTunnelLoop() {
+    if (!wifiConnected || !bridgeTunnel.active) return;
+    bridgeTunnelSocket.loop();
+}
+
+void handleMsgDeliver(JsonDocument& doc) {
+    const char* msgIdStr = doc["payload"]["message_id"];
+    const char* envelopeB64 = doc["payload"]["envelope_b64"];
+
+    if (!msgIdStr || !envelopeB64) {
+        Serial.println("[BRIDGE] Invalid msg_deliver: missing fields");
         return;
     }
 
@@ -2196,12 +3004,6 @@ void handleMsgDeliver(JsonDocument& doc) {
     }
     addMsgDedup(msgIdBytes);
 
-    uint8_t recipientHash[32];
-    for (int i = 0; i < 32; i++) {
-        char hex[3] = {recipientHashHex[i*2], recipientHashHex[i*2+1], 0};
-        recipientHash[i] = (uint8_t)strtol(hex, nullptr, 16);
-    }
-
     size_t envelopeB64Len = strlen(envelopeB64);
     size_t maxDecoded = envelopeB64Len;
     uint8_t* envelope = (uint8_t*)malloc(maxDecoded);
@@ -2213,30 +3015,11 @@ void handleMsgDeliver(JsonDocument& doc) {
     mbedtls_base64_decode(envelope, maxDecoded, &envelopeLen,
                           (const unsigned char*)envelopeB64, envelopeB64Len);
 
-    size_t fullLen = ROUTING_HEADER_SIZE + envelopeLen;
-    uint8_t* fullMsg = (uint8_t*)malloc(fullLen);
-    if (!fullMsg) {
-        free(envelope);
-        Serial.println("[BRIDGE] malloc failed for full message");
-        return;
-    }
-    memcpy(fullMsg, msgIdBytes, 16);
-    memcpy(fullMsg + 16, recipientHash, 32);
-    memcpy(fullMsg + ROUTING_HEADER_SIZE, envelope, envelopeLen);
-    free(envelope);
-
     Serial.printf("[BRIDGE] Relay->LoRa: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
 
-    meshSendFragmented(BROADCAST_ADDR, fullMsg, fullLen);
-    // Strip routing header for BLE delivery — phone expects raw envelope JSON
-    bleSendChunked(pMsgChar, fullMsg + ROUTING_HEADER_SIZE, envelopeLen);
-
-    free(fullMsg);
-
-    char ackJson[128];
-    snprintf(ackJson, sizeof(ackJson),
-        "{\"type\":\"msg_ack\",\"payload\":{\"message_id\":\"%s\"}}", msgIdStr);
-    webSocket.sendTXT(ackJson);
+    meshSendFragmented(BROADCAST_ADDR, envelope, envelopeLen);
+    bleSendChunked(pMsgChar, envelope, envelopeLen);
+    free(envelope);
 }
 
 // ============================================================================
@@ -2245,6 +3028,7 @@ void handleMsgDeliver(JsonDocument& doc) {
 
 void updateIdentityCharacteristic() {
     if (!pIdentityChar) return;
+    size_t capacityRemaining = currentBridgeCapacityRemaining();
     char json[512];
     snprintf(json, sizeof(json),
         "{\"publicKey\":\"%s\","
@@ -2255,12 +3039,13 @@ void updateIdentityCharacteristic() {
         "\"isMeshNode\":true,"
         "\"relayReachable\":%s,"
         "\"loraMode\":\"%s\","
-        "\"bridgeCapacityRemaining\":0}",
+        "\"bridgeCapacityRemaining\":%d}",
         nodePublicKeyB64,
         nodePigeonID,
         wifiConfigured ? "true" : "false",
         (bridgeState == BRIDGE_ONLINE) ? "true" : "false",
-        loraMode == LORA_MESHTASTIC ? "meshtastic" : "native"
+        loraMode == LORA_MESHTASTIC ? "meshtastic" : "native",
+        (int)capacityRemaining
     );
     pIdentityChar->setValue(json);
 }
@@ -2274,25 +3059,28 @@ void notifyBridgeStatus() {
         return;
     }
 
-    // iOS app expects ssid/ip fields in bridge_status for the WiFi Bridge UI.
-    // BLE is local/short-range so exposing these over BLE is acceptable.
-    char json[128];
+    size_t capacityRemaining = currentBridgeCapacityRemaining();
+    char json[192];
     if (bridgeState == BRIDGE_ONLINE) {
         snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"online\",\"ssid\":\"%s\",\"ip\":\"%s\"}",
-            wifiSSID, WiFi.localIP().toString().c_str());
+            "{\"type\":\"bridge_status\",\"bridge\":\"online\",\"ssid\":\"%s\",\"ip\":\"%s\",\"capacity_remaining\":%d}",
+            wifiSSID, WiFi.localIP().toString().c_str(), (int)capacityRemaining);
     } else if (bridgeState == BRIDGE_WIFI_ONLY || bridgeState == BRIDGE_AUTH) {
         snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"wifi_connected\",\"ssid\":\"%s\",\"ip\":\"%s\"}",
-            wifiSSID, WiFi.localIP().toString().c_str());
+            "{\"type\":\"bridge_status\",\"bridge\":\"wifi_connected\",\"ssid\":\"%s\",\"ip\":\"%s\",\"capacity_remaining\":%d}",
+            wifiSSID, WiFi.localIP().toString().c_str(), (int)capacityRemaining);
     } else if (bridgeState == BRIDGE_OFFLINE) {
         snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"offline\",\"ssid\":\"%s\"}", wifiSSID);
+            "{\"type\":\"bridge_status\",\"bridge\":\"offline\",\"ssid\":\"%s\",\"capacity_remaining\":%d}",
+            wifiSSID, (int)capacityRemaining);
     } else if (bridgeState == BRIDGE_NO_WIFI) {
-        snprintf(json, sizeof(json), "{\"type\":\"bridge_status\",\"bridge\":\"no_wifi\"}");
+        snprintf(json, sizeof(json),
+                 "{\"type\":\"bridge_status\",\"bridge\":\"no_wifi\",\"capacity_remaining\":%d}",
+                 (int)capacityRemaining);
     } else { // BRIDGE_CONNECTING
         snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"connecting\",\"ssid\":\"%s\"}", wifiSSID);
+            "{\"type\":\"bridge_status\",\"bridge\":\"connecting\",\"ssid\":\"%s\",\"capacity_remaining\":%d}",
+            wifiSSID, (int)capacityRemaining);
     }
     pBridgeChar->setValue(json);
     pBridgeChar->notify();
@@ -2318,8 +3106,6 @@ void bleSendChunked(BLECharacteristic* pChar, const uint8_t* data, size_t dataLe
 
     uint16_t totalChunks = (dataLen + BLE_MAX_CHUNK_DATA - 1) / BLE_MAX_CHUNK_DATA;
     if (totalChunks == 0) totalChunks = 1;
-
-    Serial.printf("[BLE TX] Sending %d bytes in %d chunks\n", dataLen, totalChunks);
 
     for (uint16_t i = 0; i < totalChunks; i++) {
         size_t offset = (size_t)i * BLE_MAX_CHUNK_DATA;
@@ -2388,9 +3174,7 @@ class MsgCharCallbacks : public BLECharacteristicCallbacks {
             evt.len = val.length();
             if (evt.len > BLE_MAX_WRITE_SIZE) evt.len = BLE_MAX_WRITE_SIZE;
             memcpy(evt.data, val.data(), evt.len);
-            if (xQueueSend(bleEventQueue, &evt, 0) != pdTRUE) {
-                Serial.println("[BLE] Event queue full, dropping write");
-            }
+            xQueueSend(bleEventQueue, &evt, 0);
         }
     }
 };
@@ -2405,9 +3189,7 @@ class AckCharCallbacks : public BLECharacteristicCallbacks {
             evt.len = val.length();
             if (evt.len > BLE_MAX_WRITE_SIZE) evt.len = BLE_MAX_WRITE_SIZE;
             memcpy(evt.data, val.data(), evt.len);
-            if (xQueueSend(bleEventQueue, &evt, 0) != pdTRUE) {
-                Serial.println("[BLE] Event queue full, dropping ACK");
-            }
+            xQueueSend(bleEventQueue, &evt, 0);
         }
     }
 };
@@ -2421,9 +3203,7 @@ class BridgeCharCallbacks : public BLECharacteristicCallbacks {
             evt.len = val.length();
             if (evt.len > BLE_MAX_WRITE_SIZE) evt.len = BLE_MAX_WRITE_SIZE;
             memcpy(evt.data, val.data(), evt.len);
-            if (xQueueSend(bleEventQueue, &evt, 0) != pdTRUE) {
-                Serial.println("[BLE] Event queue full, dropping bridge write");
-            }
+            xQueueSend(bleEventQueue, &evt, 0);
         }
     }
 };
@@ -2662,6 +3442,7 @@ void setup() {
     memset(dedupTable, 0, sizeof(dedupTable));
     memset(loraReasmTable, 0, sizeof(loraReasmTable));
     memset(bleReasmTable, 0, sizeof(bleReasmTable));
+    memset(bridgeReasmTable, 0, sizeof(bridgeReasmTable));
     memset(bleTxQueue, 0, sizeof(bleTxQueue));
     memset(loraRxQueue, 0, sizeof(loraRxQueue));
     memset(registeredPhones, 0, sizeof(registeredPhones));
@@ -2713,6 +3494,14 @@ void loop() {
         else handleLoRaReceive();
     }
 
+    // Service bridge transport early so relay pings/reconnects are not starved
+    // by heavy BLE/LoRa queue draining later in the loop.
+    if (loraMode == LORA_NATIVE) {
+        wifiLoop();
+        wsLoop();
+        bridgeTunnelLoop();
+    }
+
     // 2. Process BLE event queue (thread-safe handoff from BLE callbacks)
     BLEEvent evt;
     while (xQueueReceive(bleEventQueue, &evt, 0) == pdTRUE) {
@@ -2731,6 +3520,10 @@ void loop() {
         } else if (evt.type == BLE_EVENT_BRIDGE_WRITE) {
             handleBridgeWrite(evt.data, evt.len);
         }
+        if (loraMode == LORA_NATIVE) {
+            wsLoop();
+            bridgeTunnelLoop();
+        }
     }
 
     // 3. Process BLE->LoRa queue (reassembled messages ready to send)
@@ -2748,8 +3541,13 @@ void loop() {
                 meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
                 bridgeToRelay(bleTxQueue[i].data, bleTxQueue[i].len);
             }
+            Serial.printf("[MESH] BLE->LoRa complete: slot %d processed\n", i);
             bleTxQueue[i].pending = false;
             statBleIn++;
+            if (loraMode == LORA_NATIVE) {
+                wsLoop();
+                bridgeTunnelLoop();
+            }
         }
     }
 
@@ -2773,6 +3571,10 @@ void loop() {
             bleSendChunked(pMsgChar, bleData, bleLen);
             loraRxQueue[i].pending = false;
             statBleOut++;
+            if (loraMode == LORA_NATIVE) {
+                wsLoop();
+                bridgeTunnelLoop();
+            }
         }
     }
 
@@ -2913,11 +3715,12 @@ void loop() {
         }
     }
 
-    // 9. WiFi connection management (Native mode only)
-    if (loraMode == LORA_NATIVE) wifiLoop();
-
-    // 10. WebSocket relay connection (Native mode only)
-    if (loraMode == LORA_NATIVE) wsLoop();
+    // 9/10. Re-service bridge transport after queue draining so reconnects and
+    // relay queue draining continue even during busy radio activity.
+    if (loraMode == LORA_NATIVE) {
+        wifiLoop();
+        wsLoop();
+    }
 
     // 11. Deferred bridge status on connect + periodic re-notification
     if (bleClientConnected) {
