@@ -112,11 +112,11 @@ static const uint32_t LORA_REASM_TIMEOUT = 30000;
 // Chunk: [messageID:16][chunkIndex:2 BE][totalChunks:2 BE][payloadSize:2 BE][payload:0-480]
 static const size_t BLE_CHUNK_HEADER     = 22;
 static const size_t BLE_MAX_CHUNK_DATA   = 480;
-static const size_t BLE_REASM_SLOTS      = 8;
+static const size_t BLE_REASM_SLOTS      = 4;
 static const uint32_t BLE_REASM_TIMEOUT  = 30000;
 
 // --- BLE event queue (thread-safe BLE callback -> loop() handoff) ---
-static const size_t BLE_EVENT_QUEUE_LEN  = 64;
+static const size_t BLE_EVENT_QUEUE_LEN  = 16;
 static const size_t BLE_MAX_WRITE_SIZE   = 512;
 // --- BLE advertising watchdog ---
 static const uint32_t BLE_ADV_RESTART_MS = 5000;
@@ -323,7 +323,7 @@ volatile uint32_t pendingNotifyStart = 0;
 static const uint32_t DEFERRED_NOTIFY_DELAY_MS = 500;
 
 // Queue for BLE->LoRa messages (phone wrote to us)
-static const size_t BLE_TX_QUEUE_SIZE = 8;
+static const size_t BLE_TX_QUEUE_SIZE = 4;
 struct BLETxItem {
     uint8_t data[MAX_LORA_MSG_SIZE];
     size_t len;
@@ -332,7 +332,7 @@ struct BLETxItem {
 BLETxItem bleTxQueue[BLE_TX_QUEUE_SIZE];
 
 // Queue for LoRa->BLE messages (received from mesh, send to phone)
-static const size_t LORA_RX_QUEUE_SIZE = 8;
+static const size_t LORA_RX_QUEUE_SIZE = 4;
 struct LoRaRxItem {
     uint8_t data[MAX_LORA_MSG_SIZE];
     size_t len;
@@ -341,7 +341,7 @@ struct LoRaRxItem {
 LoRaRxItem loraRxQueue[LORA_RX_QUEUE_SIZE];
 
 // Queue for relay outbound messages (BLE->relay when WS is temporarily down)
-static const size_t RELAY_OUT_QUEUE_SIZE = 8;
+static const size_t RELAY_OUT_QUEUE_SIZE = 4;
 static const uint32_t RELAY_QUEUE_EXPIRY_MS = 120000; // 2 minutes
 struct RelayQueueEntry {
     uint8_t data[MAX_LORA_MSG_SIZE];
