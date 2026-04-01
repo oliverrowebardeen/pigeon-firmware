@@ -229,7 +229,7 @@ void handleReceived() {
 
     if (forUs) {
         // Deliver to this node
-        pkt.payload[pkt.payloadLen] = '\0'; // null-terminate for printing
+        pkt.payload[pkt.payloadLen < MAX_PAYLOAD ? pkt.payloadLen : MAX_PAYLOAD - 1] = '\0';
         Serial.printf("[RECV] from=%s to=%s msgID=%04X ttl=%d RSSI=%.1f SNR=%.1f\n",
                       senderStr, destStr, pkt.msgID, pkt.ttl, rssi, snr);
         Serial.printf("       payload: \"%s\"\n", (char*)pkt.payload);
