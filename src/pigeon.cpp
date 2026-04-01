@@ -1120,6 +1120,26 @@ void handleLoRaReceive() {
                 addDedup(pkt.sender, pkt.msgID);
                 statLoRaRx++;
 
+                // Track sender in node table — any received packet
+                // proves the node exists, not just beacons
+                {
+                    uint32_t now = millis();
+                    int slot = -1, emptySlot = -1, oldestSlot = 0;
+                    uint32_t oldestTime = UINT32_MAX;
+                    for (int i = 0; i < (int)NODE_TABLE_SIZE; i++) {
+                        if (nodeTable[i].active && addrMatch(nodeTable[i].addr, pkt.sender)) { slot = i; break; }
+                        if (!nodeTable[i].active && emptySlot < 0) emptySlot = i;
+                        if (nodeTable[i].active && nodeTable[i].lastSeen < oldestTime) {
+                            oldestTime = nodeTable[i].lastSeen;
+                            oldestSlot = i;
+                        }
+                    }
+                    if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
+                    memcpy(nodeTable[slot].addr, pkt.sender, ADDR_LEN);
+                    nodeTable[slot].lastSeen = now;
+                    nodeTable[slot].active = true;
+                }
+
                 bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
 
                 bool isBeacon = pkt.payloadLen >= 1 &&
@@ -1755,12 +1775,17 @@ void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
     // Track the sending node regardless of peer count
     {
         uint32_t now = millis();
-        int slot = -1, emptySlot = -1;
+        int slot = -1, emptySlot = -1, oldestSlot = 0;
+        uint32_t oldestTime = UINT32_MAX;
         for (int i = 0; i < (int)NODE_TABLE_SIZE; i++) {
             if (nodeTable[i].active && addrMatch(nodeTable[i].addr, sender)) { slot = i; break; }
             if (!nodeTable[i].active && emptySlot < 0) emptySlot = i;
+            if (nodeTable[i].active && nodeTable[i].lastSeen < oldestTime) {
+                oldestTime = nodeTable[i].lastSeen;
+                oldestSlot = i;
+            }
         }
-        if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : 0;
+        if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
         memcpy(nodeTable[slot].addr, sender, ADDR_LEN);
         nodeTable[slot].lastSeen = now;
         nodeTable[slot].active = true;
@@ -3518,8 +3543,8 @@ void setup() {
         bridgeState = BRIDGE_NO_WIFI;
     }
 
-    // Offset beacon timing so nodes don't all beacon at the same instant
-    lastBeaconTime = millis() - BEACON_INTERVAL_MS + (nodeAddr[5] * 37 % BEACON_INTERVAL_MS);
+    // Send first beacon immediately on boot for fast discovery
+    lastBeaconTime = 0;
 
     Serial.println();
     Serial.printf("[PIGEON] LoRa mode: %s\n",
@@ -3630,8 +3655,12 @@ void loop() {
     // 5. LoRa heartbeat beacon with presence info (gossip: local + remote peers)
     {
         uint32_t now = millis();
-        if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
+        static uint32_t beaconJitter = 0;
+        if (now - lastBeaconTime >= BEACON_INTERVAL_MS + beaconJitter) {
             lastBeaconTime = now;
+            // Random jitter (0-5s) prevents two nodes from
+            // perpetually colliding when their beacon timers align
+            beaconJitter = esp_random() % 5000;
 
             if (loraMode == LORA_MESHTASTIC) {
                 sendMshtBeacon();
