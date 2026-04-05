@@ -120,6 +120,8 @@ static const size_t BLE_EVENT_QUEUE_LEN  = 16;
 static const size_t BLE_MAX_WRITE_SIZE   = 512;
 // --- BLE advertising watchdog ---
 static const uint32_t BLE_ADV_RESTART_MS = 5000;
+// --- BLE connection keepalive ---
+static const uint32_t BLE_KEEPALIVE_TIMEOUT_MS = 60000;
 // --- Bridge status periodic re-notification ---
 static const uint32_t BRIDGE_STATUS_INTERVAL_MS = 5000;
 
@@ -270,6 +272,7 @@ struct NeighborEntry {
     float rssi;
     uint32_t lastSeen;
     bool active;
+    bool isPigeon;
 };
 
 struct MshtRelayItem {
@@ -317,6 +320,7 @@ BLECharacteristic* pIdentityChar = nullptr;
 BLECharacteristic* pAckChar = nullptr;
 BLECharacteristic* pBridgeChar = nullptr;
 volatile bool bleClientConnected = false;
+volatile uint32_t lastBLEActivity = 0;
 static uint32_t lastBridgeStatusNotify = 0;
 volatile bool pendingConnectNotify = false;
 volatile uint32_t pendingNotifyStart = 0;
@@ -782,13 +786,14 @@ void mshtAddDedup(uint32_t from, uint32_t id) {
 
 // --- Neighbor RSSI table ---
 
-void updateNeighbor(uint32_t nodeNum, float rssi) {
+void updateNeighbor(uint32_t nodeNum, float rssi, bool isPigeon = false) {
     size_t slot = 0;
     uint32_t oldest = UINT32_MAX;
     for (size_t i = 0; i < NEIGHBOR_TABLE_SIZE; i++) {
         if (neighborTable[i].active && neighborTable[i].nodeNum == nodeNum) {
             neighborTable[i].rssi = rssi;
             neighborTable[i].lastSeen = millis();
+            if (isPigeon) neighborTable[i].isPigeon = true;
             return;
         }
         if (!neighborTable[i].active) { slot = i; oldest = 0; }
@@ -797,7 +802,7 @@ void updateNeighbor(uint32_t nodeNum, float rssi) {
             slot = i;
         }
     }
-    neighborTable[slot] = {nodeNum, rssi, millis(), true};
+    neighborTable[slot] = {nodeNum, rssi, millis(), true, isPigeon};
 }
 
 // RSSI-based relay delay: strong signal = short delay, weak = long delay
@@ -1115,11 +1120,32 @@ void handleLoRaReceive() {
                 addDedup(pkt.sender, pkt.msgID);
                 statLoRaRx++;
 
+                // Track sender in node table — any received packet
+                // proves the node exists, not just beacons
+                {
+                    uint32_t now = millis();
+                    int slot = -1, emptySlot = -1, oldestSlot = 0;
+                    uint32_t oldestTime = UINT32_MAX;
+                    for (int i = 0; i < (int)NODE_TABLE_SIZE; i++) {
+                        if (nodeTable[i].active && addrMatch(nodeTable[i].addr, pkt.sender)) { slot = i; break; }
+                        if (!nodeTable[i].active && emptySlot < 0) emptySlot = i;
+                        if (nodeTable[i].active && nodeTable[i].lastSeen < oldestTime) {
+                            oldestTime = nodeTable[i].lastSeen;
+                            oldestSlot = i;
+                        }
+                    }
+                    if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
+                    memcpy(nodeTable[slot].addr, pkt.sender, ADDR_LEN);
+                    nodeTable[slot].lastSeen = now;
+                    nodeTable[slot].active = true;
+                }
+
                 bool forUs = addrMatch(pkt.dest, nodeAddr) || isBroadcast(pkt.dest);
 
-                bool isBeacon = (pkt.payload[0] == BEACON_TYPE_PRESENCE ||
+                bool isBeacon = pkt.payloadLen >= 1 &&
+                               (pkt.payload[0] == BEACON_TYPE_PRESENCE ||
                                 pkt.payload[0] == BEACON_TYPE_PRESENCE_V2);
-                if (forUs && pkt.payloadLen >= 1 && isBeacon) {
+                if (forUs && isBeacon) {
                     // Presence beacon — update peer table
                     handlePresenceBeacon(pkt.sender, pkt.payload, pkt.payloadLen, lastRSSI);
                 } else if (forUs && pkt.payloadLen >= FRAG_HEADER_SIZE && !isBeacon) {
@@ -1256,6 +1282,9 @@ void handleMshtReceive() {
         radio.startReceive();
         return;
     }
+
+    // Mark sender as a Pigeon node in the neighbor table
+    updateNeighbor(hdr.from, lastRSSI, true);
 
     // Pigeon payload — process beacon or deliver raw to BLE
     bool isBeacon = (pigeonData[0] == BEACON_TYPE_PRESENCE ||
@@ -1746,12 +1775,17 @@ void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
     // Track the sending node regardless of peer count
     {
         uint32_t now = millis();
-        int slot = -1, emptySlot = -1;
+        int slot = -1, emptySlot = -1, oldestSlot = 0;
+        uint32_t oldestTime = UINT32_MAX;
         for (int i = 0; i < (int)NODE_TABLE_SIZE; i++) {
             if (nodeTable[i].active && addrMatch(nodeTable[i].addr, sender)) { slot = i; break; }
             if (!nodeTable[i].active && emptySlot < 0) emptySlot = i;
+            if (nodeTable[i].active && nodeTable[i].lastSeen < oldestTime) {
+                oldestTime = nodeTable[i].lastSeen;
+                oldestSlot = i;
+            }
         }
-        if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : 0;
+        if (slot < 0) slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
         memcpy(nodeTable[slot].addr, sender, ADDR_LEN);
         nodeTable[slot].lastSeen = now;
         nodeTable[slot].active = true;
@@ -3085,6 +3119,7 @@ void notifyBridgeStatus() {
     pBridgeChar->setValue(json);
     pBridgeChar->notify();
     lastBridgeStatusNotify = millis();
+    lastBLEActivity = millis();
     const char* stateStr =
         (bridgeState == BRIDGE_ONLINE) ? "online" :
         (bridgeState == BRIDGE_WIFI_ONLY || bridgeState == BRIDGE_AUTH) ? "wifi_connected" :
@@ -3137,6 +3172,7 @@ void bleSendChunked(BLECharacteristic* pChar, const uint8_t* data, size_t dataLe
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
         bleClientConnected = true;
+        lastBLEActivity = millis();
         lastBLEConnId = param->connect.conn_id;
         Serial.printf("[BLE] Client connected (conn_id=%d, %d total)\n",
                       lastBLEConnId, pServer->getConnectedCount());
@@ -3346,6 +3382,36 @@ uint8_t countMeshNodes() {
     return count;
 }
 
+uint8_t countPigeonNeighbors() {
+    uint32_t now = millis();
+    uint8_t count = 0;
+    for (size_t i = 0; i < NEIGHBOR_TABLE_SIZE; i++) {
+        if (neighborTable[i].active) {
+            if (now - neighborTable[i].lastSeen > PEER_EXPIRY_MS) {
+                neighborTable[i].active = false;
+            } else if (neighborTable[i].isPigeon) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+uint8_t countMshtNeighbors() {
+    uint32_t now = millis();
+    uint8_t count = 0;
+    for (size_t i = 0; i < NEIGHBOR_TABLE_SIZE; i++) {
+        if (neighborTable[i].active) {
+            if (now - neighborTable[i].lastSeen > PEER_EXPIRY_MS) {
+                neighborTable[i].active = false;
+            } else if (!neighborTable[i].isPigeon) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
 void updateDisplay() {
     char line[17];
 
@@ -3357,9 +3423,16 @@ void updateDisplay() {
 
     // Connected phones and mesh nodes
     u8x8.setCursor(0, 3);
-    snprintf(line, sizeof(line), "Ph:%-2u Nodes:%-4u",
-             (unsigned)(pServer ? pServer->getConnectedCount() : 0),
-             (unsigned)countMeshNodes());
+    if (loraMode == LORA_MESHTASTIC) {
+        snprintf(line, sizeof(line), "P:%-2u M:%-2u Ph:%u",
+                 (unsigned)countPigeonNeighbors(),
+                 (unsigned)countMshtNeighbors(),
+                 (unsigned)(pServer ? pServer->getConnectedCount() : 0));
+    } else {
+        snprintf(line, sizeof(line), "Ph:%-2u Nodes:%-4u",
+                 (unsigned)(pServer ? pServer->getConnectedCount() : 0),
+                 (unsigned)countMeshNodes());
+    }
     u8x8.print(line);
 
     // RSSI
@@ -3470,8 +3543,8 @@ void setup() {
         bridgeState = BRIDGE_NO_WIFI;
     }
 
-    // Offset beacon timing so nodes don't all beacon at the same instant
-    lastBeaconTime = millis() - BEACON_INTERVAL_MS + (nodeAddr[5] * 37 % BEACON_INTERVAL_MS);
+    // Send first beacon immediately on boot for fast discovery
+    lastBeaconTime = 0;
 
     Serial.println();
     Serial.printf("[PIGEON] LoRa mode: %s\n",
@@ -3505,6 +3578,7 @@ void loop() {
     // 2. Process BLE event queue (thread-safe handoff from BLE callbacks)
     BLEEvent evt;
     while (xQueueReceive(bleEventQueue, &evt, 0) == pdTRUE) {
+        lastBLEActivity = millis();
         if (evt.type == BLE_EVENT_MSG_WRITE) {
             handleBLEChunkWrite(evt.data, evt.len);
         } else if (evt.type == BLE_EVENT_ACK_WRITE) {
@@ -3558,12 +3632,12 @@ void loop() {
             // Bridge to relay server using full data (Native mode only)
             if (loraMode == LORA_NATIVE)
                 bridgeToRelay(loraRxQueue[i].data, loraRxQueue[i].len);
-            // Strip routing header before BLE delivery — phone expects raw envelope JSON.
-            // All messages through the mesh have a routing header prepended by the sender.
-            // Detect by checking if data after the header starts with '{' (valid JSON envelope).
+            // Strip routing header before BLE delivery — phone expects raw envelope.
+            // Native mode prepends a routing header; Meshtastic mode does not.
             const uint8_t* bleData = loraRxQueue[i].data;
             size_t bleLen = loraRxQueue[i].len;
-            if (bleLen > ROUTING_HEADER_SIZE &&
+            if (loraMode == LORA_NATIVE &&
+                bleLen > ROUTING_HEADER_SIZE &&
                 bleData[ROUTING_HEADER_SIZE] == '{') {
                 bleData += ROUTING_HEADER_SIZE;
                 bleLen -= ROUTING_HEADER_SIZE;
@@ -3581,8 +3655,12 @@ void loop() {
     // 5. LoRa heartbeat beacon with presence info (gossip: local + remote peers)
     {
         uint32_t now = millis();
-        if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
+        static uint32_t beaconJitter = 0;
+        if (now - lastBeaconTime >= BEACON_INTERVAL_MS + beaconJitter) {
             lastBeaconTime = now;
+            // Random jitter (0-5s) prevents two nodes from
+            // perpetually colliding when their beacon timers align
+            beaconJitter = esp_random() % 5000;
 
             if (loraMode == LORA_MESHTASTIC) {
                 sendMshtBeacon();
@@ -3742,7 +3820,27 @@ void loop() {
         pendingConnectNotify = false;
     }
 
-    // 12. BLE advertising watchdog — restart if no client and interval elapsed
+    // 12. BLE connection keepalive — drop ghost connections
+    if (bleClientConnected && pServer) {
+        uint32_t now = millis();
+        if (now - lastBLEActivity >= BLE_KEEPALIVE_TIMEOUT_MS) {
+            Serial.println("[BLE] Keepalive timeout — dropping stale connection");
+            // Disconnect all clients to clear ghost connections
+            for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+                if (registeredPhones[i].active) {
+                    pServer->disconnect(registeredPhones[i].connId);
+                }
+            }
+            // Force state reset in case onDisconnect doesn't fire
+            bleClientConnected = false;
+            for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
+                registeredPhones[i].active = false;
+            }
+            BLEDevice::startAdvertising();
+        }
+    }
+
+    // 13. BLE advertising watchdog — restart if no client and interval elapsed
     if (!bleClientConnected) {
         uint32_t now = millis();
         if (now - lastBLEAdvRestart >= BLE_ADV_RESTART_MS) {
@@ -3751,7 +3849,7 @@ void loop() {
         }
     }
 
-    // 13. Update OLED display every second
+    // 14. Update OLED display every second
     {
         uint32_t now = millis();
         if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {

@@ -35,6 +35,7 @@ Nodes support a second LoRa mode that speaks the [Meshtastic](https://meshtastic
 |-----------|------|
 | MCU | [Seeed XIAO ESP32S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html) |
 | Radio | [Wio-SX1262 LoRa Shield](https://www.seeedstudio.com/Wio-SX1262-with-XIAO-ESP32S3-p-5982.html) (Kit version, B2B connector) |
+| Display | SSD1306 128x64 OLED (I2C, included on XIAO Expansion Board) |
 | Antenna | 915MHz LoRa antenna (SMA or IPEX, must be connected before powering on) |
 
 **Pin mapping (Kit/B2B version):**
@@ -211,9 +212,11 @@ Nodes need only USB power (5V). No data connection to the host. Battery packs, p
 ```
 src/
   pigeon.cpp   — Production firmware (BLE + LoRa mesh + WiFi bridge)
-  mesh.cpp     — Mesh-only firmware (no BLE, for testing)
+  mesh.cpp     — Mesh-only test firmware (no BLE)
   tx.cpp       — Transmitter test firmware
   rx.cpp       — Receiver test firmware
+lib/
+  curve25519/  — Vendored curve25519-donna (BSD license, see THIRD-PARTY-LICENSES)
 platformio.ini — Build environments
 ```
 
@@ -224,4 +227,4 @@ platformio.ini — Build environments
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Third-party code is listed in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
