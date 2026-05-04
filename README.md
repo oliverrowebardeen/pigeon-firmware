@@ -29,6 +29,15 @@ Nodes support a second LoRa mode that speaks the [Meshtastic](https://meshtastic
 - Switch modes via BLE: `{"lora_mode":"meshtastic"}` or `{"lora_mode":"native"}`
 - No Meshtastic GPL code — implemented from the public wire format spec
 
+### Neighbor Discovery
+
+Nodes track who else is on the mesh from the packets they receive. Two in-memory tables drive this:
+
+- **Node table** — recently-heard Pigeon nodes (capacity 8, LRU eviction). Populated from any received packet, not just beacons, so a node that relays without beaconing is still discovered.
+- **Neighbor table** — per-node RSSI (capacity 16), used for the Meshtastic intelligent-relay delay calculation and for the OLED neighbor view.
+
+In Meshtastic mode, stock Meshtastic nodes are tracked alongside Pigeon nodes so the neighbor view shows the full local mesh. Periodic beacons (jittered to avoid TX collisions) keep tables fresh; stale entries expire after a few beacon intervals.
+
 ## Hardware
 
 | Component | Part |
