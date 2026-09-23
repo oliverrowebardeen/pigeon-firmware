@@ -31,3 +31,15 @@ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
+
+Build dependencies pinned in platformio.ini
+=========================================
+RadioLib 7.7.1 — MIT — licenses/RadioLib.txt
+ArduinoJson 7.4.3 — MIT — licenses/ArduinoJson.txt
+U8g2 2.36.18 — BSD-2-Clause code plus font-specific notices — licenses/U8g2.txt
+WebSockets 2.7.3 — LGPL-2.1 — licenses/WebSockets.txt
+
+The ESP32 Arduino framework and toolchain are supplied by espressif32 6.13.0.
+Their own component licenses also apply to distributed firmware. The MIT
+license for Pigeon source does not replace dependency licenses. Preserve
+upstream notices and review their distribution terms when shipping binaries.

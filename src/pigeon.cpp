@@ -1,3 +1,4 @@
+#include "protocol_validation.h"
 // Pigeon Firmware - Phase 5: BLE Bridge + Mesh Relay
 // Unified firmware: LoRa mesh relay + BLE GATT server for iOS app.
 // The node is an opaque relay — it never inspects message content.
@@ -692,19 +693,6 @@ size_t pbEncodeVarint(uint8_t* buf, uint32_t val) {
     return i;
 }
 
-uint32_t pbDecodeVarint(const uint8_t* buf, size_t len, size_t& pos) {
-    uint32_t val = 0;
-    uint8_t shift = 0;
-    while (pos < len) {
-        uint8_t b = buf[pos++];
-        val |= (uint32_t)(b & 0x7F) << shift;
-        if (!(b & 0x80)) break;
-        shift += 7;
-        if (shift >= 35) break; // overflow guard
-    }
-    return val;
-}
-
 // Encode Pigeon data as protobuf Data{portnum=256, payload=pigeonData}
 size_t mshtEncodeData(const uint8_t* pigeonData, size_t pigeonLen, uint8_t* buf) {
     size_t pos = 0;
@@ -719,32 +707,7 @@ size_t mshtEncodeData(const uint8_t* pigeonData, size_t pigeonLen, uint8_t* buf)
 // Decode protobuf Data — extract portnum and payload fields
 bool mshtDecodeData(const uint8_t* buf, size_t len,
                     uint32_t& portnum, const uint8_t*& outPayload, size_t& outLen) {
-    size_t pos = 0;
-    portnum = 0;
-    outPayload = nullptr;
-    outLen = 0;
-    while (pos < len) {
-        uint32_t tag = pbDecodeVarint(buf, len, pos);
-        uint32_t fieldNum = tag >> 3;
-        uint32_t wireType = tag & 0x07;
-        if (fieldNum == 1 && wireType == 0) {        // portnum, varint
-            portnum = pbDecodeVarint(buf, len, pos);
-        } else if (fieldNum == 2 && wireType == 2) { // payload, length-delimited
-            outLen = pbDecodeVarint(buf, len, pos);
-            if (outLen > len || pos + outLen > len) { outLen = 0; break; }
-            outPayload = buf + pos;
-            pos += outLen;
-        } else if (wireType == 0) {
-            pbDecodeVarint(buf, len, pos); // skip unknown varint
-        } else if (wireType == 2) {
-            uint32_t slen = pbDecodeVarint(buf, len, pos);
-            if (slen > len || pos + slen > len) break;
-            pos += slen; // skip unknown bytes
-        } else {
-            break; // unknown wire type, stop
-        }
-    }
-    return outPayload != nullptr;
+    return pigeon::decodeMeshData(buf, len, portnum, outPayload, outLen);
 }
 
 // --- Meshtastic packet ID generation ---
@@ -1009,6 +972,8 @@ void sendMshtBeacon() {
 int loraReassemble(const uint8_t* sender, uint16_t fragGroupID,
                    uint8_t fragIndex, uint8_t fragTotal,
                    const uint8_t* fragData, size_t fragDataLen) {
+    if (!pigeon::validFragment(fragIndex, fragTotal, fragDataLen,
+                              MAX_FRAG_DATA, 16, MAX_LORA_MSG_SIZE)) return -1;
     uint32_t now = millis();
 
     // Find existing slot or allocate new
@@ -1052,7 +1017,7 @@ int loraReassemble(const uint8_t* sender, uint16_t fragGroupID,
     }
 
     LoRaReasmSlot& slot = loraReasmTable[slotIdx];
-    if (fragIndex >= 16 || fragIndex >= fragTotal) return -1;
+    if (slot.fragTotal != fragTotal) return -1;
 
     if (!slot.fragPresent[fragIndex]) {
         // Store fragment data at the correct offset
@@ -1335,7 +1300,9 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
     uint16_t payloadSize = ((uint16_t)data[20] << 8) | data[21];
     const uint8_t* payload = data + BLE_CHUNK_HEADER;
 
-    if (payloadSize > len - BLE_CHUNK_HEADER) {
+    if (payloadSize != len - BLE_CHUNK_HEADER ||
+        !pigeon::validFragment(chunkIndex, totalChunks, payloadSize,
+                               BLE_MAX_CHUNK_DATA, 16, MAX_LORA_MSG_SIZE)) {
         Serial.printf("[BLE RX] Payload size mismatch\n");
         return;
     }
@@ -1379,7 +1346,7 @@ void handleBLEChunkWrite(const uint8_t* data, size_t len) {
     }
 
     BLEReasmSlot& slot = bleReasmTable[slotIdx];
-    if (chunkIndex >= 16 || chunkIndex >= totalChunks) return;
+    if (slot.totalChunks != totalChunks) return;
 
     if (!slot.chunkPresent[chunkIndex]) {
         size_t offset = (size_t)chunkIndex * BLE_MAX_CHUNK_DATA;
@@ -1519,7 +1486,9 @@ void handleBridgeChunkWrite(const uint8_t* data, size_t len) {
     uint16_t payloadSize = ((uint16_t)data[20] << 8) | data[21];
     const uint8_t* payload = data + BLE_CHUNK_HEADER;
 
-    if (payloadSize > len - BLE_CHUNK_HEADER || totalChunks == 0 || totalChunks > BRIDGE_MAX_CHUNKS) {
+    if (payloadSize != len - BLE_CHUNK_HEADER ||
+        !pigeon::validFragment(chunkIndex, totalChunks, payloadSize,
+                               BLE_MAX_CHUNK_DATA, BRIDGE_MAX_CHUNKS, BRIDGE_MAX_MSG_SIZE)) {
         return;
     }
 
@@ -1561,7 +1530,7 @@ void handleBridgeChunkWrite(const uint8_t* data, size_t len) {
     }
 
     BridgeReasmSlot& slot = bridgeReasmTable[slotIdx];
-    if (chunkIndex >= BRIDGE_MAX_CHUNKS || chunkIndex >= totalChunks) return;
+    if (slot.totalChunks != totalChunks) return;
 
     if (!slot.chunkPresent[chunkIndex]) {
         size_t offset = (size_t)chunkIndex * BLE_MAX_CHUNK_DATA;
@@ -1576,6 +1545,12 @@ void handleBridgeChunkWrite(const uint8_t* data, size_t len) {
         size_t totalLen = 0;
         for (uint16_t i = 0; i < slot.totalChunks; i++) {
             totalLen += slot.chunkSizes[i];
+        }
+        // Non-final BLE chunks may be shorter than the negotiated maximum.
+        size_t pos = 0;
+        for (uint16_t i = 0; i < slot.totalChunks; ++i) {
+            memmove(slot.data + pos, slot.data + (size_t)i * BLE_MAX_CHUNK_DATA, slot.chunkSizes[i]);
+            pos += slot.chunkSizes[i];
         }
         slot.active = false;
         handleBridgeEnvelope(slot.data, totalLen);
@@ -2406,7 +2381,8 @@ void handleAuthChallenge(JsonDocument& doc) {
     const char* challengeId = doc["payload"]["challenge_id"];
     int64_t issuedAtMs = doc["payload"]["issued_at_ms"];
 
-    if (!serverPubB64 || !nonceB64 || !challengeId) {
+    if (!serverPubB64 || !nonceB64 || !pigeon::validChallengeID(challengeId) ||
+        !doc["payload"]["issued_at_ms"].is<int64_t>() || issuedAtMs < 0) {
         Serial.println("[AUTH] Invalid auth_challenge: missing fields");
         Serial.printf("[AUTH]   server_pubkey_b64=%s nonce_b64=%s challenge_id=%s\n",
             serverPubB64 ? "ok" : "MISSING",
@@ -2418,18 +2394,18 @@ void handleAuthChallenge(JsonDocument& doc) {
     // Decode server ephemeral public key (32 bytes)
     uint8_t serverPub[32];
     size_t decoded = 0;
-    mbedtls_base64_decode(serverPub, 32, &decoded,
+    int decodeStatus = mbedtls_base64_decode(serverPub, 32, &decoded,
                           (const unsigned char*)serverPubB64, strlen(serverPubB64));
-    if (decoded != 32) {
+    if (decodeStatus != 0 || decoded != 32) {
         Serial.printf("[AUTH] Invalid server public key length: %d\n", (int)decoded);
         return;
     }
 
     // Decode nonce (server sends 16 bytes)
     uint8_t nonce[16];
-    mbedtls_base64_decode(nonce, 16, &decoded,
+    decodeStatus = mbedtls_base64_decode(nonce, 16, &decoded,
                           (const unsigned char*)nonceB64, strlen(nonceB64));
-    if (decoded == 0 || decoded > 16) {
+    if (decodeStatus != 0 || decoded != 16) {
         Serial.printf("[AUTH] Invalid nonce length: %d\n", (int)decoded);
         return;
     }
