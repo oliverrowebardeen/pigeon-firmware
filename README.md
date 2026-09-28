@@ -1,6 +1,6 @@
 # Pigeon Mesh Node Firmware
 
-Firmware for Pigeon mesh network nodes. Each node is a self-contained LoRa + BLE relay that moves encrypted messages between phones over a decentralized mesh network. Nodes are opaque relays — they never inspect or decrypt message content.
+Firmware for Pigeon mesh network nodes. Each node is a self-contained LoRa + BLE relay that moves encrypted messages between phones over a decentralized mesh network. Nodes forward encrypted message content. Bridge registration/control messages addressed to the node are decrypted by the node.
 
 **Phone → BLE → Node → LoRa → Mesh → Node → BLE → Phone**
 
@@ -60,6 +60,10 @@ In Meshtastic mode, stock Meshtastic nodes are tracked alongside Pigeon nodes so
 | MISO | 8 |
 
 > **Note:** The non-kit version (pin header shield) uses different pins (CS=5, DIO1=2, RESET=3, BUSY=4). This firmware targets the kit version only.
+
+## Security Status
+
+This is experimental firmware. See [SECURITY.md](SECURITY.md) before deployment: Bluetooth provisioning/control currently assumes trusted physical surroundings, the default Meshtastic channel key is public, and NVS encryption is not a defense against full flash extraction. These limitations do not replace the client envelope encryption, but they matter for node administration and metadata privacy.
 
 ## Building & Flashing
 
@@ -237,3 +241,7 @@ platformio.ini — Build environments
 ## License
 
 MIT — see [LICENSE](LICENSE). Third-party code is listed in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
+
+## Validation
+
+CI builds all four PlatformIO environments and runs host parser tests with address and undefined-behavior sanitizers. Direct dependencies are pinned to the versions in `platformio.ini`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the test command and required device-test notes. Successful builds do not verify radio behavior, interoperability, or unattended operation.
