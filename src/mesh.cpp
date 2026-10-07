@@ -1,7 +1,8 @@
-// Pigeon Firmware - Phase 4: Bidirectional Mesh Relay
+// Pigeon - Mesh relay test firmware
 // Unified firmware — all nodes are equal, can send, receive, and relay.
 
 #include <Arduino.h>
+#include "pigeon_config.h"
 #include <SPI.h>
 #include <RadioLib.h>
 
@@ -15,12 +16,12 @@
 #define LORA_MISO  8
 
 // --- LoRa parameters ---
-static const float LORA_FREQ      = 915.0;   // MHz (US ISM band)
+static const float LORA_FREQ      = PIGEON_LORA_FREQUENCY_MHZ;
 static const float LORA_BW        = 125.0;   // kHz bandwidth
 static const uint8_t LORA_SF      = 9;       // Spreading factor
 static const uint8_t LORA_CR      = 7;       // Coding rate 4/7
 static const uint8_t LORA_SYNC    = 0x12;    // Private network sync word
-static const int8_t LORA_POWER    = 22;      // TX power in dBm (max for SX1262)
+static const int8_t LORA_POWER    = PIGEON_LORA_POWER_DBM;
 static const uint16_t LORA_PREAMBLE = 8;     // Preamble length
 static const float LORA_TCXO_V    = 1.8;     // TCXO voltage via DIO3
 
@@ -67,12 +68,6 @@ uint32_t lastBeaconTime = 0;
 
 void IRAM_ATTR onReceive() {
     rxFlag = true;
-}
-
-// Format MAC address as hex string
-void macToStr(const uint8_t* mac, char* buf) {
-    snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 // Check if two addresses match
@@ -179,12 +174,7 @@ void meshSend(const uint8_t* dest, const uint8_t* payload, uint8_t payloadLen) {
     // Add to dedup so we don't re-process our own relayed messages
     addDedup(pkt.sender, pkt.msgID);
 
-    char senderStr[18], destStr[18];
-    macToStr(pkt.sender, senderStr);
-    macToStr(pkt.dest, destStr);
-
-    Serial.printf("[SENT] from=%s to=%s msgID=%04X ttl=%d len=%d\n",
-                  senderStr, destStr, pkt.msgID, pkt.ttl, pkt.payloadLen);
+    Serial.printf("[SENT] ttl=%d len=%d\n", pkt.ttl, pkt.payloadLen);
 
     if (!meshTransmit(pkt)) {
         Serial.println("[SENT] TX FAILED");
@@ -212,13 +202,9 @@ void handleReceived() {
         return;
     }
 
-    char senderStr[18], destStr[18];
-    macToStr(pkt.sender, senderStr);
-    macToStr(pkt.dest, destStr);
-
     // Check dedup
     if (isDuplicate(pkt.sender, pkt.msgID)) {
-        Serial.printf("[DEDUP] from=%s msgID=%04X (already seen)\n", senderStr, pkt.msgID);
+        Serial.println("[DEDUP] Already seen");
         radio.startReceive();
         return;
     }
@@ -229,21 +215,18 @@ void handleReceived() {
 
     if (forUs) {
         // Deliver to this node
-        pkt.payload[pkt.payloadLen < MAX_PAYLOAD ? pkt.payloadLen : MAX_PAYLOAD - 1] = '\0';
-        Serial.printf("[RECV] from=%s to=%s msgID=%04X ttl=%d RSSI=%.1f SNR=%.1f\n",
-                      senderStr, destStr, pkt.msgID, pkt.ttl, rssi, snr);
-        Serial.printf("       payload: \"%s\"\n", (char*)pkt.payload);
+        Serial.printf("[RECV] len=%d ttl=%d RSSI=%.1f SNR=%.1f\n",
+                      pkt.payloadLen, pkt.ttl, rssi, snr);
     }
 
     // Relay if TTL > 0 (relay broadcast messages AND messages not for us)
     if (!addrMatch(pkt.sender, nodeAddr)) {
         if (pkt.ttl <= 1) {
-            Serial.printf("[DROP] from=%s msgID=%04X TTL expired\n", senderStr, pkt.msgID);
+            Serial.println("[DROP] TTL expired");
         } else {
             // Decrement TTL and relay
             pkt.ttl--;
-            Serial.printf("[RELAY] from=%s to=%s msgID=%04X ttl=%d->%d\n",
-                          senderStr, destStr, pkt.msgID, pkt.ttl + 1, pkt.ttl);
+            Serial.printf("[RELAY] ttl=%d->%d\n", pkt.ttl + 1, pkt.ttl);
             meshTransmit(pkt);
         }
     }
@@ -258,12 +241,8 @@ void setup() {
     // Get MAC address as node identity
     esp_efuse_mac_get_default(nodeAddr);
 
-    char nodeStr[18];
-    macToStr(nodeAddr, nodeStr);
-
     Serial.println("=================================");
     Serial.println("  Pigeon Mesh Node");
-    Serial.printf("  ID: %s\n", nodeStr);
     Serial.println("=================================");
     Serial.println();
 

@@ -30,4 +30,10 @@ Thumbs.db
 *.p12
 .env
 .env.*
-
+include/pigeon_config.local.h
+platformio.local.ini
+*.log
+*.pcap
+*.pcapng
+*.mobileprovision
+*.pfx

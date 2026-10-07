@@ -1,7 +1,9 @@
 #include "protocol_validation.h"
-// Pigeon Firmware - Phase 5: BLE Bridge + Mesh Relay
+#include "pigeon_config.h"
+#include "pigeon_logging.h"
+// Pigeon firmware: BLE bridge and LoRa mesh relay
 // Unified firmware: LoRa mesh relay + BLE GATT server for iOS app.
-// The node is an opaque relay — it never inspects message content.
+// Client message content stays encrypted; node-addressed bridge control is decrypted.
 //
 // BLE protocol matches pigeon-ios exactly:
 //   Service: E1A71B10-9F11-4F1F-93F8-1A0D3A2B0001
@@ -45,12 +47,12 @@
 #define LORA_MISO  8
 
 // --- LoRa parameters ---
-static const float LORA_FREQ        = 915.0;   // MHz (US ISM band)
+static const float LORA_FREQ        = PIGEON_LORA_FREQUENCY_MHZ;
 static const float LORA_BW          = 125.0;   // kHz bandwidth
 static const uint8_t LORA_SF        = 9;       // Spreading factor
 static const uint8_t LORA_CR        = 7;       // Coding rate 4/7
 static const uint8_t LORA_SYNC_WORD = 0x12;    // Private network sync word
-static const int8_t LORA_POWER      = 22;      // TX power in dBm (max)
+static const int8_t LORA_POWER      = PIGEON_LORA_POWER_DBM;
 static const uint16_t LORA_PREAMBLE = 8;       // Preamble length
 static const float LORA_TCXO_V      = 1.8;     // TCXO voltage via DIO3
 
@@ -421,9 +423,13 @@ enum BridgeState : uint8_t {
 static BridgeState bridgeState = BRIDGE_NO_WIFI;
 
 // Relay server
-static const char* RELAY_HOST = "relay.example.com";
-static const uint16_t RELAY_PORT = 443;
-static const char* RELAY_PATH = "/v1/ws";
+static const char* RELAY_HOST = PIGEON_RELAY_HOST;
+static const uint16_t RELAY_PORT = PIGEON_RELAY_PORT;
+static const char* RELAY_PATH = PIGEON_RELAY_PATH;
+#ifdef PIGEON_RELAY_ROOT_CA
+static const char RELAY_ROOT_CA[] PROGMEM = PIGEON_RELAY_ROOT_CA;
+#else
+// Public ISRG Root X1 trust anchor, not a device certificate or private key.
 static const char RELAY_ROOT_CA[] PROGMEM = R"CERT(
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -457,6 +463,7 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )CERT";
+#endif
 static const char* WIFI_PASS_LEGACY_KEY = "wifi_pass";
 static const char* WIFI_PASS_VERSION_KEY = "wifi_pw_ver";
 static const char* WIFI_PASS_LENGTH_KEY = "wifi_pw_len";
@@ -529,11 +536,6 @@ void handleBridgeControlPayload(const uint8_t* plaintext,
                                 size_t plaintextLen,
                                 const uint8_t* senderPublicKey);
 
-void macToStr(const uint8_t* mac, char* buf) {
-    snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 bool addrMatch(const uint8_t* a, const uint8_t* b) {
     return memcmp(a, b, ADDR_LEN) == 0;
 }
@@ -577,10 +579,10 @@ void loadOrGenerateKey() {
         prefs.putBytes("privkey", nodePrivateKey, 32);
         prefs.putBytes("pubkey", nodePublicKey, 32);
         prefs.putUChar("key_version", 2);
-        Serial.println("[KEY] Generated new X25519 keypair");
+        PIGEON_TRACE("[KEY] Generated new X25519 keypair\n");
     } else {
         prefs.getBytes("pubkey", nodePublicKey, 32);
-        Serial.println("[KEY] Loaded existing X25519 keypair from NVS");
+        PIGEON_TRACE("[KEY] Loaded existing X25519 keypair from NVS\n");
     }
 
     // Load LoRa protocol mode
@@ -830,10 +832,7 @@ void meshSendFragmented(const uint8_t* dest, const uint8_t* data, size_t dataLen
     uint8_t fragTotal = (dataLen + MAX_FRAG_DATA - 1) / MAX_FRAG_DATA;
     if (fragTotal == 0) fragTotal = 1;
 
-    char destStr[18];
-    macToStr(dest, destStr);
-    Serial.printf("[LORA TX] to=%s fragGroup=%04X frags=%d totalBytes=%d\n",
-                  destStr, fragGroupID, fragTotal, dataLen);
+    PIGEON_TRACE("[LORA TX] frags=%d totalBytes=%d\n", fragTotal, dataLen);
 
     for (uint8_t i = 0; i < fragTotal; i++) {
         MeshPacket pkt;
@@ -960,7 +959,7 @@ void sendMshtBeacon() {
     size_t beaconLen = buildBeaconPayload(beaconBuf, sizeof(beaconBuf));
     if (beaconLen > 0) {
         mshtTransmit(MSHT_BROADCAST, beaconBuf, beaconLen);
-        Serial.printf("[MSHT BEACON] Sent v2 presence (%d bytes)\n", beaconLen);
+        PIGEON_TRACE("[MSHT BEACON] Sent v2 presence (%d bytes)\n", beaconLen);
     }
 }
 
@@ -1050,10 +1049,7 @@ int loraReassemble(const uint8_t* sender, uint16_t fragGroupID,
                 loraRxQueue[q].pending = true;
                 slot.active = false;
 
-                char senderStr[18];
-                macToStr(sender, senderStr);
-                Serial.printf("[LORA RX] Reassembled from=%s fragGroup=%04X totalBytes=%d\n",
-                              senderStr, fragGroupID, totalLen);
+                PIGEON_TRACE("[LORA RX] Reassembled totalBytes=%d\n", totalLen);
                 return q;
             }
         }
@@ -1078,8 +1074,6 @@ void handleLoRaReceive() {
         MeshPacket pkt;
 
         if (deserializePacket(buf, len, pkt)) {
-            char senderStr[18];
-            macToStr(pkt.sender, senderStr);
 
             if (!isDuplicate(pkt.sender, pkt.msgID)) {
                 addDedup(pkt.sender, pkt.msgID);
@@ -1122,11 +1116,9 @@ void handleLoRaReceive() {
                     size_t fragDataLen = pkt.payloadLen - FRAG_HEADER_SIZE;
 
                     if (fragTotal == 0 || fragTotal > 16) {
-                        Serial.printf("[LORA RX] Invalid fragTotal=%d from %s, dropping\n",
-                                      fragTotal, senderStr);
+                        Serial.printf("[LORA RX] Invalid fragTotal=%d, dropping\n", fragTotal);
                     } else {
-                        Serial.printf("[LORA RX] from=%s frag=%d/%d fragGroup=%04X\n",
-                                      senderStr, fragIndex + 1, fragTotal, fragGroupID);
+                        PIGEON_TRACE("[LORA RX] frag=%d/%d\n", fragIndex + 1, fragTotal);
                         loraReassemble(pkt.sender, fragGroupID, fragIndex, fragTotal, fragData, fragDataLen);
                     }
                 }
@@ -1154,7 +1146,7 @@ void handleLoRaReceive() {
                 }
             }
         }
-    } else if (state != -7) { // Don't spam CRC errors
+    } else if (state != -7) { // Ignore CRC errors
         Serial.printf("[LORA] Read error: %d\n", state);
     }
 
@@ -1242,8 +1234,7 @@ void handleMshtReceive() {
 
     if (portnum != MSHT_PORTNUM_PRIVATE_APP || pigeonLen == 0) {
         // Stock Meshtastic traffic — relay only, no BLE delivery
-        Serial.printf("[MSHT RX] Stock Meshtastic portnum=%d from=%08X (relay only)\n",
-                      portnum, hdr.from);
+        PIGEON_TRACE("[MSHT RX] Non-Pigeon portnum=%d (relay only)\n", portnum);
         radio.startReceive();
         return;
     }
@@ -1273,8 +1264,7 @@ void handleMshtReceive() {
             }
         }
         if (queued) {
-            Serial.printf("[MSHT RX] from=%08X payload=%d bytes, queued for BLE\n",
-                          hdr.from, pigeonLen);
+            PIGEON_TRACE("[MSHT RX] payload=%d bytes, queued for BLE\n", pigeonLen);
         } else {
             Serial.println("[MSHT RX] LoRa->BLE queue full, dropping payload");
         }
@@ -1576,7 +1566,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
         prefs.putUChar("lora_mode", newMode);
         prefs.end();
 
-        Serial.printf("[BRIDGE] LoRa mode set to %s, rebooting...\n",
+        PIGEON_TRACE("[BRIDGE] LoRa mode set to %s, rebooting...\n",
                       newMode == LORA_MESHTASTIC ? "Meshtastic" : "Native");
         delay(500);
         ESP.restart();
@@ -1585,6 +1575,10 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
 
     // WiFi provisioning: {"ssid":"...", "pass":"..."}
     if (!doc["ssid"].isNull()) {
+        if (!RELAY_HOST[0]) {
+            Serial.println("[BRIDGE] Configure a relay host before provisioning WiFi");
+            return;
+        }
         if (loraMode == LORA_MESHTASTIC) {
             Serial.println("[BRIDGE] WiFi bridge not available in Meshtastic mode");
             return;
@@ -1595,7 +1589,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
             Serial.println("[BRIDGE] Empty SSID, ignoring");
             return;
         }
-        Serial.println("[BRIDGE] WiFi provisioning requested");
+        PIGEON_TRACE("[BRIDGE] WiFi provisioning requested\n");
         saveWiFiCredentials(ssid, pass);
         setupWiFi();
         // Defer notification — WiFi.begin() triggers a radio coex switch that
@@ -1610,7 +1604,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
     if (!doc["wifi"].isNull()) {
         const char* wifiCmd = doc["wifi"];
         if (wifiCmd && strcmp(wifiCmd, "off") == 0) {
-            Serial.println("[BRIDGE] WiFi disconnect requested");
+            PIGEON_TRACE("[BRIDGE] WiFi disconnect requested\n");
             WiFi.disconnect(true);
             clearWiFiCredentials();
             notifyBridgeStatus();
@@ -1636,7 +1630,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
         // Check if already registered
         for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
             if (registeredPhones[i].active && strcmp(registeredPhones[i].pigeonID, pigeonID) == 0) {
-                Serial.printf("[BRIDGE] Phone %s already registered (slot %d)\n", pigeonID, i);
+                PIGEON_TRACE("[BRIDGE] Phone already registered (slot %d)\n", i);
                 return;
             }
         }
@@ -1651,10 +1645,9 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
                                             (const unsigned char*)pubKeyB64, strlen(pubKeyB64));
             if (ret == 0 && decoded == PUBKEY_LEN) {
                 hasPubKey = true;
-                Serial.printf("[BRIDGE] Phone %s provided public key\n", pigeonID);
+                PIGEON_TRACE("[BRIDGE] Phone provided public key\n");
             } else {
-                Serial.printf("[BRIDGE] Phone %s publicKey decode failed (ret=%d, len=%d)\n",
-                              pigeonID, ret, (int)decoded);
+                Serial.printf("[BRIDGE] Public key decode failed (ret=%d, len=%d)\n", ret, (int)decoded);
             }
         }
 
@@ -1667,8 +1660,7 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
                 registeredPhones[i].hasPublicKey = hasPubKey;
                 if (hasPubKey) memcpy(registeredPhones[i].publicKey, phonePubKey, PUBKEY_LEN);
                 registeredPhones[i].active = true;
-                Serial.printf("[BRIDGE] Registered phone %s (slot %d, conn_id=%d, hasKey=%d)\n",
-                              pigeonID, i, lastBLEConnId, hasPubKey);
+                PIGEON_TRACE("[BRIDGE] Registered phone (slot %d, hasKey=%d)\n", i, hasPubKey);
                 return;
             }
         }
@@ -1693,7 +1685,7 @@ void pigeonIDFromPubKey(const uint8_t* pubKey, char* pidOut, uint8_t* pidBytesOu
 
 // Update or insert a peer into the peer table
 void upsertPeer(const char* pid, const uint8_t* pubKey, bool hasPubKey,
-                float rssi, const char* via) {
+                float rssi) {
     uint32_t now = millis();
 
     // Skip our own registered phones
@@ -1721,7 +1713,7 @@ void upsertPeer(const char* pid, const uint8_t* pubKey, bool hasPubKey,
         slot = (emptySlot >= 0) ? emptySlot : oldestSlot;
         memcpy(peerTable[slot].pigeonID, pid, 9);
         peerTableChanged = true;
-        Serial.printf("[PEERS] New peer %s via %s RSSI=%.1f\n", pid, via, rssi);
+        PIGEON_TRACE("[PEERS] New peer RSSI=%.1f\n", rssi);
     }
 
     // Upgrade: if we didn't have pubkey but now do, update it
@@ -1742,10 +1734,7 @@ void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
 
     uint8_t beaconType = payload[0];
     uint8_t numPeers = payload[1];
-    char senderStr[18];
-    macToStr(sender, senderStr);
-    Serial.printf("[BEACON RX] from=%s type=0x%02X peers=%d RSSI=%.1f\n",
-                  senderStr, beaconType, numPeers, rssi);
+    PIGEON_TRACE("[BEACON RX] type=0x%02X peers=%d RSSI=%.1f\n", beaconType, numPeers, rssi);
 
     // Track the sending node regardless of peer count
     {
@@ -1772,22 +1761,20 @@ void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
         // V2: [0x02][numPeers][pubKey_1:32B][pubKey_2:32B]...
         size_t expectedLen = 2 + (size_t)numPeers * PUBKEY_LEN;
         if (payloadLen < expectedLen) {
-            Serial.printf("[BEACON] Truncated v2 from %s (got %d, need %d)\n",
-                          senderStr, payloadLen, (int)expectedLen);
+            Serial.printf("[BEACON] Truncated v2 (got %d, need %d)\n", payloadLen, (int)expectedLen);
             return;
         }
         for (uint8_t p = 0; p < numPeers; p++) {
             const uint8_t* pubKey = payload + 2 + p * PUBKEY_LEN;
             char pid[9];
             pigeonIDFromPubKey(pubKey, pid, nullptr);
-            upsertPeer(pid, pubKey, true, rssi, senderStr);
+            upsertPeer(pid, pubKey, true, rssi);
         }
     } else {
         // V1 legacy: [0x01][numPhones][pigeonID_1:4B][pigeonID_2:4B]...
         size_t expectedLen = 2 + (size_t)numPeers * PIGEON_ID_LEN;
         if (payloadLen < expectedLen) {
-            Serial.printf("[BEACON] Truncated v1 from %s (got %d, need %d)\n",
-                          senderStr, payloadLen, (int)expectedLen);
+            Serial.printf("[BEACON] Truncated v1 (got %d, need %d)\n", payloadLen, (int)expectedLen);
             return;
         }
         for (uint8_t p = 0; p < numPeers; p++) {
@@ -1795,7 +1782,7 @@ void handlePresenceBeacon(const uint8_t* sender, const uint8_t* payload,
             char pid[9];
             snprintf(pid, 9, "%02x%02x%02x%02x",
                      pidBytes[0], pidBytes[1], pidBytes[2], pidBytes[3]);
-            upsertPeer(pid, nullptr, false, rssi, senderStr);
+            upsertPeer(pid, nullptr, false, rssi);
         }
     }
 }
@@ -1807,7 +1794,7 @@ uint8_t expirePeers() {
     for (int i = 0; i < (int)PEER_TABLE_SIZE; i++) {
         if (peerTable[i].active) {
             if (now - peerTable[i].lastSeen > PEER_EXPIRY_MS) {
-                Serial.printf("[PEERS] Expired peer %s\n", peerTable[i].pigeonID);
+                PIGEON_TRACE("[PEERS] Expired peer\n");
                 peerTable[i].active = false;
                 peerTableChanged = true;
             } else {
@@ -2219,7 +2206,7 @@ void setupWiFi() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    Serial.println("[WIFI] Connecting...");
+    PIGEON_TRACE("[WIFI] Connecting...\n");
     WiFi.begin(wifiSSID, wifiPass);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     bridgeState = BRIDGE_CONNECTING;
@@ -2234,7 +2221,7 @@ void wifiLoop() {
     if (nowConnected && !wifiConnected) {
         wifiConnected = true;
         bridgeState = BRIDGE_WIFI_ONLY;
-        Serial.println("[WIFI] Connected");
+        PIGEON_TRACE("[WIFI] Connected\n");
         connectWebSocket();
         notifyBridgeStatus();
     } else if (!nowConnected && wifiConnected) {
@@ -2243,13 +2230,13 @@ void wifiLoop() {
         wsAuthenticated = false;
         closeBridgeTunnel(false, "bridge_unavailable", "bridge unavailable");
         bridgeState = BRIDGE_CONNECTING;
-        Serial.println("[WIFI] Connection lost, will auto-reconnect");
+        PIGEON_TRACE("[WIFI] Connection lost, will auto-reconnect\n");
         notifyBridgeStatus();
     } else if (!nowConnected) {
         uint32_t now = millis();
         if (now - lastWifiRetry >= WIFI_RETRY_MS) {
             lastWifiRetry = now;
-            Serial.println("[WIFI] Retrying...");
+            PIGEON_TRACE("[WIFI] Retrying...\n");
             WiFi.disconnect();
             WiFi.begin(wifiSSID, wifiPass);
         }
@@ -2269,7 +2256,7 @@ void handleMsgDeliver(JsonDocument& doc);
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_DISCONNECTED:
-            Serial.println("[WS] Disconnected");
+            PIGEON_TRACE("[WS] Disconnected\n");
             wsConnected = false;
             wsAuthenticated = false;
             bridgeState = wifiConnected ? BRIDGE_OFFLINE : BRIDGE_CONNECTING;
@@ -2277,7 +2264,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             break;
 
         case WStype_CONNECTED:
-            Serial.println("[WS] Connected to relay");
+            PIGEON_TRACE("[WS] Connected to relay\n");
             wsConnected = true;
             wsReconnectDelay = 1000;
             bridgeState = BRIDGE_AUTH;
@@ -2298,30 +2285,25 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             if (strcmp(msgType, "auth_challenge") == 0) {
                 handleAuthChallenge(doc);
             } else if (strcmp(msgType, "auth_ok") == 0) {
-                Serial.println("[AUTH] Authenticated!");
+                PIGEON_TRACE("[AUTH] Authenticated!\n");
                 wsAuthenticated = true;
                 bridgeState = BRIDGE_ONLINE;
                 notifyBridgeStatus();
                 drainRelayQueue();
             } else if (strcmp(msgType, "auth_error") == 0) {
-                Serial.printf("[AUTH] Auth failed: %s\n",
-                    doc["payload"]["reason"] | "unknown");
+                Serial.println("[AUTH] Authentication rejected by relay");
                 wsReconnectDelay = WS_MAX_BACKOFF;
                 webSocket.disconnect();
             } else if (strcmp(msgType, "msg_accepted") == 0) {
-                Serial.printf("[BRIDGE] Relay accepted message: %s\n",
-                    doc["payload"]["message_id"] | "?");
+                PIGEON_TRACE("[BRIDGE] Relay accepted message\n");
             } else if (strcmp(msgType, "msg_deliver") == 0) {
                 handleMsgDeliver(doc);
             } else if (strcmp(msgType, "msg_dup") == 0) {
-                Serial.printf("[BRIDGE] Server deduped message: %s\n",
-                    doc["payload"]["message_id"] | "?");
+                PIGEON_TRACE("[BRIDGE] Server deduplicated message\n");
             } else if (strcmp(msgType, "ping") == 0) {
                 sendRelayPong();
             } else if (strcmp(msgType, "error") == 0) {
-                Serial.printf("[BRIDGE] Relay error: code=%s message=%s\n",
-                    doc["payload"]["code"] | "?",
-                    doc["payload"]["message"] | "?");
+                Serial.println("[BRIDGE] Relay returned an error");
             }
             break;
         }
@@ -2336,7 +2318,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 void connectWebSocket() {
-    Serial.printf("[WS] Connecting to %s:%d%s over TLS\n", RELAY_HOST, RELAY_PORT, RELAY_PATH);
+    PIGEON_TRACE("[WS] Connecting to configured relay over TLS\n");
     webSocket.beginSslWithCA(RELAY_HOST, RELAY_PORT, RELAY_PATH, RELAY_ROOT_CA);
     webSocket.onEvent(webSocketEvent);
     webSocket.setReconnectInterval(0);
@@ -2368,7 +2350,7 @@ void sendAuthHello() {
         "{\"type\":\"auth_hello\",\"payload\":{\"client_pubkey_b64\":\"%s\"}}",
         nodePublicKeyB64);
     webSocket.sendTXT(json);
-    Serial.println("[AUTH] Sent auth_hello");
+    PIGEON_TRACE("[AUTH] Sent auth_hello\n");
 }
 
 void sendRelayPong() {
@@ -2418,7 +2400,7 @@ void handleAuthChallenge(JsonDocument& doc) {
     // RFC 7748 section 6.1: abort if shared secret is all-zero
     uint8_t zero[32] = {0};
     if (memcmp(sharedSecret, zero, 32) == 0) {
-        Serial.println("[AUTH] ECDH produced zero shared secret — aborting");
+        Serial.printf("[AUTH] ECDH produced zero shared secret — aborting\n");
         memset(sharedSecret, 0, sizeof(sharedSecret));
         webSocket.disconnect();
         return;
@@ -2468,7 +2450,7 @@ void handleAuthChallenge(JsonDocument& doc) {
         "{\"type\":\"auth_prove\",\"payload\":{\"challenge_id\":\"%s\",\"proof_b64\":\"%s\"}}",
         challengeId, proofB64);
     webSocket.sendTXT(json);
-    Serial.println("[AUTH] Sent auth_prove");
+    PIGEON_TRACE("[AUTH] Sent auth_prove\n");
 
     memset(sharedSecret, 0, sizeof(sharedSecret));
     memset(authKey, 0, sizeof(authKey));
@@ -2499,11 +2481,12 @@ void queueForRelay(const uint8_t* data, size_t len) {
     relayOutQueue[slot].len = len;
     relayOutQueue[slot].pending = true;
     relayOutQueue[slot].timestamp = now;
-    Serial.printf("[BRIDGE] Queued for relay (slot %d, %d bytes) — will send when WS reconnects\n", slot, (int)len);
+    PIGEON_TRACE("[BRIDGE] Queued for relay (slot %d, %d bytes) — will send when WS reconnects\n", slot, (int)len);
 }
 
 void bridgeToRelay(const uint8_t* data, size_t len) {
-    Serial.printf("[BRIDGE] bridgeToRelay called: len=%d wsAuth=%d\n", (int)len, wsAuthenticated);
+    if (!RELAY_HOST[0] || !wifiConfigured) return;
+    PIGEON_TRACE("[BRIDGE] bridgeToRelay called: len=%d wsAuth=%d\n", (int)len, wsAuthenticated);
 
     const uint8_t* msgIdBytes = nullptr;
     const uint8_t* recipientHash = nullptr;
@@ -2514,7 +2497,7 @@ void bridgeToRelay(const uint8_t* data, size_t len) {
     uint8_t parsedRecipientHash[32];
     bool usedEnvelopeFallback = false;
 
-    if (len >= ROUTING_HEADER_SIZE && data[ROUTING_HEADER_SIZE] == '{') {
+    if (len > ROUTING_HEADER_SIZE && data[ROUTING_HEADER_SIZE] == '{') {
         msgIdBytes = data;
         recipientHash = data + 16;
         envelope = data + ROUTING_HEADER_SIZE;
@@ -2527,8 +2510,8 @@ void bridgeToRelay(const uint8_t* data, size_t len) {
                 Serial.printf("[BRIDGE] DROPPED: len=%d < ROUTING_HEADER_SIZE=%d and envelope parse failed: %s\n",
                               (int)len, (int)ROUTING_HEADER_SIZE, err.c_str());
             } else {
-                Serial.printf("[BRIDGE] DROPPED: payload missing routed envelope at offset %d (byte=0x%02x) and envelope parse failed: %s\n",
-                              (int)ROUTING_HEADER_SIZE, data[ROUTING_HEADER_SIZE], err.c_str());
+                Serial.printf("[BRIDGE] DROPPED: payload missing routed envelope at offset %d and envelope parse failed: %s\n",
+                              (int)ROUTING_HEADER_SIZE, err.c_str());
             }
             return;
         }
@@ -2541,7 +2524,7 @@ void bridgeToRelay(const uint8_t* data, size_t len) {
         }
 
         if (!parseUUID(msgIdStr, parsedMsgId)) {
-            Serial.printf("[BRIDGE] DROPPED: invalid envelope UUID '%s'\n", msgIdStr);
+            Serial.println("[BRIDGE] DROPPED: invalid envelope UUID");
             return;
         }
 
@@ -2564,7 +2547,7 @@ void bridgeToRelay(const uint8_t* data, size_t len) {
     }
 
     if (!wsAuthenticated) {
-        Serial.println("[BRIDGE] WS not authenticated — queueing for retry");
+        PIGEON_TRACE("[BRIDGE] WS not authenticated — queueing for retry\n");
         queueForRelay(data, len);
         return;
     }
@@ -2613,9 +2596,9 @@ void bridgeToRelay(const uint8_t* data, size_t len) {
 
     webSocket.sendTXT(json);
     if (usedEnvelopeFallback) {
-        Serial.printf("[BRIDGE] Envelope->Relay fallback: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+        PIGEON_TRACE("[BRIDGE] Envelope->Relay fallback: %d bytes\n", (int)envelopeLen);
     } else {
-        Serial.printf("[BRIDGE] LoRa->Relay: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+        PIGEON_TRACE("[BRIDGE] LoRa->Relay: %d bytes\n", (int)envelopeLen);
     }
 
     free(envelopeB64);
@@ -2628,11 +2611,11 @@ void drainRelayQueue() {
         if (relayOutQueue[i].pending) {
             uint32_t age = millis() - relayOutQueue[i].timestamp;
             if (age > RELAY_QUEUE_EXPIRY_MS) {
-                Serial.printf("[BRIDGE] Relay queue slot %d expired (%d ms old)\n", i, (int)age);
+                PIGEON_TRACE("[BRIDGE] Relay queue slot %d expired (%d ms old)\n", i, (int)age);
                 relayOutQueue[i].pending = false;
                 continue;
             }
-            Serial.printf("[BRIDGE] Draining relay queue slot %d (%d bytes, %d ms old)\n",
+            PIGEON_TRACE("[BRIDGE] Draining relay queue slot %d (%d bytes, %d ms old)\n",
                           i, (int)relayOutQueue[i].len, (int)age);
             bridgeToRelay(relayOutQueue[i].data, relayOutQueue[i].len);
             relayOutQueue[i].pending = false;
@@ -2789,7 +2772,7 @@ void bridgeTunnelWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
             if (!bridgeTunnel.active) break;
             bridgeTunnel.relayConnected = true;
             sendBridgeTunnelOpened(bridgeTunnel.tunnelID, bridgeTunnel.phonePublicKey);
-            Serial.printf("[BRIDGE TUNNEL] Opened relay tunnel %s\n", bridgeTunnel.tunnelID);
+            PIGEON_TRACE("[BRIDGE TUNNEL] Opened relay tunnel\n");
             break;
 
         case WStype_TEXT:
@@ -2805,8 +2788,7 @@ void bridgeTunnelWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) 
         case WStype_DISCONNECTED: {
             if (!bridgeTunnel.active) break;
 
-            Serial.printf("[BRIDGE TUNNEL] Disconnected tunnel %s (connected=%d)\n",
-                          bridgeTunnel.tunnelID,
+            PIGEON_TRACE("[BRIDGE TUNNEL] Disconnected (connected=%d)\n",
                           bridgeTunnel.relayConnected ? 1 : 0);
 
             char tunnelID[37];
@@ -2897,7 +2879,7 @@ void openBridgeTunnel(const char* tunnelID, const uint8_t* phonePublicKey) {
     bridgeTunnel.relayConnected = false;
 
     notifyBridgeStatus();
-    Serial.printf("[BRIDGE TUNNEL] Opening relay tunnel %s\n", bridgeTunnel.tunnelID);
+    PIGEON_TRACE("[BRIDGE TUNNEL] Opening relay tunnel\n");
 }
 
 void handleBridgeControlPayload(const uint8_t* plaintext,
@@ -3009,7 +2991,7 @@ void handleMsgDeliver(JsonDocument& doc) {
     }
 
     if (isMsgDuplicate(msgIdBytes)) {
-        Serial.printf("[BRIDGE] Duplicate msg_deliver: %s\n", msgIdStr);
+        PIGEON_TRACE("[BRIDGE] Duplicate msg_deliver\n");
         return;
     }
     addMsgDedup(msgIdBytes);
@@ -3025,7 +3007,7 @@ void handleMsgDeliver(JsonDocument& doc) {
     mbedtls_base64_decode(envelope, maxDecoded, &envelopeLen,
                           (const unsigned char*)envelopeB64, envelopeB64Len);
 
-    Serial.printf("[BRIDGE] Relay->LoRa: msgID=%s (%d bytes)\n", msgIdStr, (int)envelopeLen);
+    PIGEON_TRACE("[BRIDGE] Relay->LoRa: %d bytes\n", (int)envelopeLen);
 
     meshSendFragmented(BROADCAST_ADDR, envelope, envelopeLen);
     bleSendChunked(pMsgChar, envelope, envelopeLen);
@@ -3063,45 +3045,27 @@ void updateIdentityCharacteristic() {
 void notifyBridgeStatus() {
     updateIdentityCharacteristic();
     if (!pBridgeChar || !bleClientConnected) {
-        Serial.printf("[BRIDGE] Skip notify (char=%s, client=%s)\n",
+        PIGEON_TRACE("[BRIDGE] Skip notify (char=%s, client=%s)\n",
                       pBridgeChar ? "ok" : "null",
                       bleClientConnected ? "yes" : "no");
         return;
     }
 
     size_t capacityRemaining = currentBridgeCapacityRemaining();
-    char json[192];
-    if (bridgeState == BRIDGE_ONLINE) {
-        snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"online\",\"ssid\":\"%s\",\"ip\":\"%s\",\"capacity_remaining\":%d}",
-            wifiSSID, WiFi.localIP().toString().c_str(), (int)capacityRemaining);
-    } else if (bridgeState == BRIDGE_WIFI_ONLY || bridgeState == BRIDGE_AUTH) {
-        snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"wifi_connected\",\"ssid\":\"%s\",\"ip\":\"%s\",\"capacity_remaining\":%d}",
-            wifiSSID, WiFi.localIP().toString().c_str(), (int)capacityRemaining);
-    } else if (bridgeState == BRIDGE_OFFLINE) {
-        snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"offline\",\"ssid\":\"%s\",\"capacity_remaining\":%d}",
-            wifiSSID, (int)capacityRemaining);
-    } else if (bridgeState == BRIDGE_NO_WIFI) {
-        snprintf(json, sizeof(json),
-                 "{\"type\":\"bridge_status\",\"bridge\":\"no_wifi\",\"capacity_remaining\":%d}",
-                 (int)capacityRemaining);
-    } else { // BRIDGE_CONNECTING
-        snprintf(json, sizeof(json),
-            "{\"type\":\"bridge_status\",\"bridge\":\"connecting\",\"ssid\":\"%s\",\"capacity_remaining\":%d}",
-            wifiSSID, (int)capacityRemaining);
-    }
-    pBridgeChar->setValue(json);
-    pBridgeChar->notify();
-    lastBridgeStatusNotify = millis();
-    lastBLEActivity = millis();
     const char* stateStr =
         (bridgeState == BRIDGE_ONLINE) ? "online" :
         (bridgeState == BRIDGE_WIFI_ONLY || bridgeState == BRIDGE_AUTH) ? "wifi_connected" :
         (bridgeState == BRIDGE_OFFLINE) ? "offline" :
         (bridgeState == BRIDGE_NO_WIFI) ? "no_wifi" : "connecting";
-    Serial.printf("[BRIDGE] Notified bridge state: %s\n", stateStr);
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"type\":\"bridge_status\",\"bridge\":\"%s\",\"capacity_remaining\":%d}",
+             stateStr, (int)capacityRemaining);
+    pBridgeChar->setValue(json);
+    pBridgeChar->notify();
+    lastBridgeStatusNotify = millis();
+    lastBLEActivity = millis();
+    PIGEON_TRACE("[BRIDGE] Notified bridge state: %s\n", stateStr);
 }
 
 // ============================================================================
@@ -3150,7 +3114,7 @@ class ServerCallbacks : public BLEServerCallbacks {
         bleClientConnected = true;
         lastBLEActivity = millis();
         lastBLEConnId = param->connect.conn_id;
-        Serial.printf("[BLE] Client connected (conn_id=%d, %d total)\n",
+        PIGEON_TRACE("[BLE] Client connected (conn_id=%d, %d total)\n",
                       lastBLEConnId, pServer->getConnectedCount());
         // Defer bridge status notification — give the phone time to discover
         // services and subscribe to notifications (~500ms typical on iOS)
@@ -3162,13 +3126,12 @@ class ServerCallbacks : public BLEServerCallbacks {
         uint16_t disconnId = param->disconnect.conn_id;
         uint16_t remaining = pServer->getConnectedCount();
         bleClientConnected = (remaining > 0);
-        Serial.printf("[BLE] Client disconnected (conn_id=%d, %d remaining)\n",
+        PIGEON_TRACE("[BLE] Client disconnected (conn_id=%d, %d remaining)\n",
                       disconnId, remaining);
         // Remove phone registration for this specific connection
         for (size_t i = 0; i < MAX_REGISTERED_PHONES; i++) {
             if (registeredPhones[i].active && registeredPhones[i].connId == disconnId) {
-                Serial.printf("[BLE] Unregistered phone %s (conn_id=%d disconnected)\n",
-                              registeredPhones[i].pigeonID, disconnId);
+                PIGEON_TRACE("[BLE] Unregistered phone (conn_id=%d disconnected)\n", disconnId);
                 registeredPhones[i].active = false;
             }
         }
@@ -3287,7 +3250,7 @@ void setupBLE() {
     pAdvertising->setMaxPreferred(0x0C);  // 15ms max connection interval
     BLEDevice::startAdvertising();
 
-    Serial.printf("[BLE] GATT server started, advertising as 'Pigeon' (ID: %s)\n", nodePigeonID);
+    Serial.println("[BLE] GATT server started, advertising as 'Pigeon'");
 }
 
 // ============================================================================
@@ -3466,7 +3429,8 @@ void setup() {
     // Initialize OLED display
     u8x8.begin();
     u8x8.setFlipMode(1); // Expansion board mounts display upside-down
-    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    // Public-domain X11 font; see THIRD-PARTY-LICENSES. Uses one 8x8 tile per glyph.
+    u8x8.setFont(u8x8_font_5x8_r);
     u8x8.clear();
     u8x8.setCursor(0, 0);
     u8x8.print("PIGEON");
@@ -3484,7 +3448,6 @@ void setup() {
 
     Serial.println("=================================");
     Serial.println("  Pigeon Mesh Node");
-    Serial.printf("  Pigeon ID: %s\n", nodePigeonID);
     Serial.println("=================================");
     Serial.println();
 
@@ -3511,7 +3474,7 @@ void setup() {
     setupBLE();
 
     // WiFi/bridge only available in Native mode
-    if (loraMode == LORA_NATIVE) {
+    if (loraMode == LORA_NATIVE && RELAY_HOST[0]) {
         loadWiFiCredentials();
         setupWiFi();
     } else {
@@ -3519,14 +3482,12 @@ void setup() {
         bridgeState = BRIDGE_NO_WIFI;
     }
 
-    // Send first beacon immediately on boot for fast discovery
+    // The loop sends the first beacon once BEACON_INTERVAL_MS has elapsed.
     lastBeaconTime = 0;
 
     Serial.println();
     Serial.printf("[PIGEON] LoRa mode: %s\n",
                   loraMode == LORA_MESHTASTIC ? "Meshtastic Compatible" : "Pigeon Native");
-    if (loraMode == LORA_MESHTASTIC)
-        Serial.printf("[PIGEON] Meshtastic NodeNum: %08X\n", mshtNodeNum);
     Serial.println("[PIGEON] Node ready. BLE + LoRa mesh active.");
     Serial.println();
 
@@ -3558,7 +3519,7 @@ void loop() {
         if (evt.type == BLE_EVENT_MSG_WRITE) {
             handleBLEChunkWrite(evt.data, evt.len);
         } else if (evt.type == BLE_EVENT_ACK_WRITE) {
-            Serial.printf("[BLE ACK] Received %d bytes, broadcasting over LoRa\n", evt.len);
+            PIGEON_TRACE("[BLE ACK] Received %d bytes, broadcasting over LoRa\n", evt.len);
             if (loraMode == LORA_MESHTASTIC) {
                 if (evt.len <= MSHT_MAX_PIGEON_DATA)
                     mshtTransmit(MSHT_BROADCAST, evt.data, evt.len);
@@ -3579,7 +3540,7 @@ void loop() {
     // 3. Process BLE->LoRa queue (reassembled messages ready to send)
     for (int i = 0; i < (int)BLE_TX_QUEUE_SIZE; i++) {
         if (bleTxQueue[i].pending) {
-            Serial.printf("[MESH] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
+            PIGEON_TRACE("[MESH] BLE->LoRa: %d bytes\n", bleTxQueue[i].len);
             if (loraMode == LORA_MESHTASTIC) {
                 if (bleTxQueue[i].len <= MSHT_MAX_PIGEON_DATA) {
                     mshtTransmit(MSHT_BROADCAST, bleTxQueue[i].data, bleTxQueue[i].len);
@@ -3591,7 +3552,7 @@ void loop() {
                 meshSendFragmented(BROADCAST_ADDR, bleTxQueue[i].data, bleTxQueue[i].len);
                 bridgeToRelay(bleTxQueue[i].data, bleTxQueue[i].len);
             }
-            Serial.printf("[MESH] BLE->LoRa complete: slot %d processed\n", i);
+            PIGEON_TRACE("[MESH] BLE->LoRa complete: slot %d processed\n", i);
             bleTxQueue[i].pending = false;
             statBleIn++;
             if (loraMode == LORA_NATIVE) {
@@ -3604,7 +3565,7 @@ void loop() {
     // 4. Process LoRa->BLE queue (received from mesh, push to phone)
     for (int i = 0; i < (int)LORA_RX_QUEUE_SIZE; i++) {
         if (loraRxQueue[i].pending) {
-            Serial.printf("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
+            PIGEON_TRACE("[MESH] LoRa->BLE: %d bytes\n", loraRxQueue[i].len);
             // Bridge to relay server using full data (Native mode only)
             if (loraMode == LORA_NATIVE)
                 bridgeToRelay(loraRxQueue[i].data, loraRxQueue[i].len);
@@ -3652,7 +3613,7 @@ void loop() {
                     addDedup(pkt.sender, pkt.msgID);
                     meshTransmitRaw(pkt);
                     uint8_t numKeys = pkt.payload[1];
-                    Serial.printf("[BEACON] Sent v2 presence (keys=%d)\n", numKeys);
+                    PIGEON_TRACE("[BEACON] Sent v2 presence (keys=%d)\n", numKeys);
                 }
             }
         }
@@ -3783,7 +3744,7 @@ void loop() {
         if (pendingConnectNotify &&
             now - pendingNotifyStart >= DEFERRED_NOTIFY_DELAY_MS) {
             pendingConnectNotify = false;
-            Serial.println("[BRIDGE] Deferred notify");
+            PIGEON_TRACE("[BRIDGE] Deferred notify\n");
             notifyBridgeStatus();
         }
         // Periodic re-send for settled states (not transient CONNECTING/AUTH)

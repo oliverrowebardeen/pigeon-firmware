@@ -1,7 +1,8 @@
-// Pigeon Firmware - Phase 3: Receiver
+// Pigeon - Receiver test firmware
 // Listens for LoRa packets using interrupt-driven receive, prints with RSSI
 
 #include <Arduino.h>
+#include "pigeon_config.h"
 #include <SPI.h>
 #include <RadioLib.h>
 
@@ -15,12 +16,12 @@
 #define LORA_MISO  8
 
 // --- LoRa parameters (must match transmitter) ---
-#define LORA_FREQ       915.0
+#define LORA_FREQ       PIGEON_LORA_FREQUENCY_MHZ
 #define LORA_BW         125.0
 #define LORA_SF         9
 #define LORA_CR         7
 #define LORA_SYNC       0x12
-#define LORA_POWER      22
+#define LORA_POWER      PIGEON_LORA_POWER_DBM
 #define LORA_PREAMBLE   8
 #define LORA_TCXO_V     1.8
 
@@ -107,13 +108,12 @@ void loop() {
     if (state == RADIOLIB_ERR_NONE) {
         rxCount++;
         int len = radio.getPacketLength();
-        buf[len] = '\0';
 
         Serial.print("[RX #");
         Serial.print(rxCount);
-        Serial.print("] \"");
-        Serial.print((char*)buf);
-        Serial.print("\"  RSSI: ");
+        Serial.print("] bytes: ");
+        Serial.print(len);
+        Serial.print("  RSSI: ");
         Serial.print(radio.getRSSI());
         Serial.print(" dBm  SNR: ");
         Serial.print(radio.getSNR());
