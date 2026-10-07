@@ -1,6 +1,8 @@
 # Security
 
-Report potential vulnerabilities privately using [GitHub private vulnerability reporting](https://github.com/oliverrowebardeen/pigeon-firmware/security/advisories/new) when the repository offers **Report a vulnerability**. If that option is unavailable, use the existing project mailbox **security@example.com**. Include the affected commit, reproduction steps, and impact. Do not put credentials, private keys, or exploitable details into public issues.
+Report potential vulnerabilities privately using [GitHub private vulnerability reporting](https://github.com/oliverrowebardeen/pigeon-firmware/security/advisories/new). Include the affected commit, reproduction steps, and impact in the private report.
+
+If the form is unavailable, open an issue asking the maintainer to enable private vulnerability reporting. Include no vulnerability details, exploit code, personal information, or credentials in that public request. Wait for a private channel before sending the report.
 
 Only test devices and relay instances you own or are authorized to test. This is experimental software; the code review and automated tests are not an independent cryptographic audit.
 
