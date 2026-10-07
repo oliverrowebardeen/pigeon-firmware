@@ -11,6 +11,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Install PlatformIO
         run: pipx install platformio==6.1.19
       - name: Build every firmware environment
@@ -20,6 +22,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Test untrusted input with memory and undefined-behavior sanitizers
         run: |
           clang++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/protocol_validation_test.cpp -o /tmp/protocol-tests
@@ -31,6 +35,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install Gitleaks with release checksum verification
         env:
           GITLEAKS_VERSION: 8.30.1
