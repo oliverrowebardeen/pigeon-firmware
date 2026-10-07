@@ -1,4 +1,5 @@
 #include "protocol_validation.h"
+#include "pigeon_config.h"
 // Pigeon Firmware - Phase 5: BLE Bridge + Mesh Relay
 // Unified firmware: LoRa mesh relay + BLE GATT server for iOS app.
 // The node is an opaque relay — it never inspects message content.
@@ -45,12 +46,12 @@
 #define LORA_MISO  8
 
 // --- LoRa parameters ---
-static const float LORA_FREQ        = 915.0;   // MHz (US ISM band)
+static const float LORA_FREQ        = PIGEON_LORA_FREQUENCY_MHZ;
 static const float LORA_BW          = 125.0;   // kHz bandwidth
 static const uint8_t LORA_SF        = 9;       // Spreading factor
 static const uint8_t LORA_CR        = 7;       // Coding rate 4/7
 static const uint8_t LORA_SYNC_WORD = 0x12;    // Private network sync word
-static const int8_t LORA_POWER      = 22;      // TX power in dBm (max)
+static const int8_t LORA_POWER      = PIGEON_LORA_POWER_DBM;
 static const uint16_t LORA_PREAMBLE = 8;       // Preamble length
 static const float LORA_TCXO_V      = 1.8;     // TCXO voltage via DIO3
 
@@ -421,9 +422,13 @@ enum BridgeState : uint8_t {
 static BridgeState bridgeState = BRIDGE_NO_WIFI;
 
 // Relay server
-static const char* RELAY_HOST = "relay.example.com";
-static const uint16_t RELAY_PORT = 443;
-static const char* RELAY_PATH = "/v1/ws";
+static const char* RELAY_HOST = PIGEON_RELAY_HOST;
+static const uint16_t RELAY_PORT = PIGEON_RELAY_PORT;
+static const char* RELAY_PATH = PIGEON_RELAY_PATH;
+#ifdef PIGEON_RELAY_ROOT_CA
+static const char RELAY_ROOT_CA[] PROGMEM = PIGEON_RELAY_ROOT_CA;
+#else
+// Public ISRG Root X1 trust anchor, not a device certificate or private key.
 static const char RELAY_ROOT_CA[] PROGMEM = R"CERT(
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -457,6 +462,7 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )CERT";
+#endif
 static const char* WIFI_PASS_LEGACY_KEY = "wifi_pass";
 static const char* WIFI_PASS_VERSION_KEY = "wifi_pw_ver";
 static const char* WIFI_PASS_LENGTH_KEY = "wifi_pw_len";
@@ -1585,6 +1591,10 @@ void handleBridgeWrite(const uint8_t* data, size_t len) {
 
     // WiFi provisioning: {"ssid":"...", "pass":"..."}
     if (!doc["ssid"].isNull()) {
+        if (!RELAY_HOST[0]) {
+            Serial.println("[BRIDGE] Configure a relay host before provisioning WiFi");
+            return;
+        }
         if (loraMode == LORA_MESHTASTIC) {
             Serial.println("[BRIDGE] WiFi bridge not available in Meshtastic mode");
             return;
@@ -2503,6 +2513,7 @@ void queueForRelay(const uint8_t* data, size_t len) {
 }
 
 void bridgeToRelay(const uint8_t* data, size_t len) {
+    if (!RELAY_HOST[0] || !wifiConfigured) return;
     Serial.printf("[BRIDGE] bridgeToRelay called: len=%d wsAuth=%d\n", (int)len, wsAuthenticated);
 
     const uint8_t* msgIdBytes = nullptr;
@@ -3511,7 +3522,7 @@ void setup() {
     setupBLE();
 
     // WiFi/bridge only available in Native mode
-    if (loraMode == LORA_NATIVE) {
+    if (loraMode == LORA_NATIVE && RELAY_HOST[0]) {
         loadWiFiCredentials();
         setupWiFi();
     } else {

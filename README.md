@@ -16,7 +16,7 @@ Nodes are equal peers. There's no coordinator, no routing table, no configuratio
 
 ### WiFi Bridge Mode
 
-When configured with WiFi credentials (via BLE), a node stores the password encrypted in NVS, connects to the [pigeon-relay](https://github.com/oliverrowebardeen/pigeon-relay) server over `wss://`, and bridges traffic between the local LoRa mesh and the internet. This lets phones reach each other across the internet through any bridge-enabled node.
+When built with a relay endpoint and configured with WiFi credentials (via BLE), a node stores the password encrypted in NVS, connects to the [pigeon-relay](https://github.com/oliverrowebardeen/pigeon-relay) server over `wss://`, and bridges traffic between the local LoRa mesh and the internet. This lets phones reach each other across the internet through any bridge-enabled node.
 
 ### Meshtastic Compatible Mode
 
@@ -78,6 +78,14 @@ brew install platformio
 ```bash
 pio run -e pigeon
 ```
+
+### Local relay and radio settings
+
+Copy `include/pigeon_config.example.h` to `include/pigeon_config.local.h` and edit it before building. The local file is ignored by Git. The default relay host is empty: BLE and LoRa remain available, while WiFi provisioning and internet bridging are disabled. Set `PIGEON_RELAY_HOST` to the hostname of a relay you operate or are authorized to use. The default port is 443 and path is `/v1/ws`.
+
+Both relay connections validate TLS using the public ISRG Root X1 CA. If your relay uses a different CA, define `PIGEON_RELAY_ROOT_CA` as its PEM string in the local header. Do not put private keys or WiFi credentials in build configuration; provision WiFi through BLE in trusted surroundings.
+
+`PIGEON_LORA_FREQUENCY_MHZ` and `PIGEON_LORA_POWER_DBM` override the frequency and transmit power for all four environments and both Pigeon modes. Review the radio limitations below before flashing.
 
 ### Flash
 

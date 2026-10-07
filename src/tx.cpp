@@ -2,6 +2,7 @@
 // Sends "hello from pigeon" every 3 seconds at max power
 
 #include <Arduino.h>
+#include "pigeon_config.h"
 #include <SPI.h>
 #include <RadioLib.h>
 
@@ -15,12 +16,12 @@
 #define LORA_MISO  8
 
 // --- LoRa parameters ---
-#define LORA_FREQ       915.0   // MHz
+#define LORA_FREQ       PIGEON_LORA_FREQUENCY_MHZ   // MHz
 #define LORA_BW         125.0   // kHz
 #define LORA_SF         9       // Spreading factor
 #define LORA_CR         7       // Coding rate 4/7
 #define LORA_SYNC       0x12    // Private network sync word
-#define LORA_POWER      22      // dBm (max)
+#define LORA_POWER      PIGEON_LORA_POWER_DBM      // dBm (max)
 #define LORA_PREAMBLE   8
 #define LORA_TCXO_V     1.8
 

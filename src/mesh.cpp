@@ -2,6 +2,7 @@
 // Unified firmware — all nodes are equal, can send, receive, and relay.
 
 #include <Arduino.h>
+#include "pigeon_config.h"
 #include <SPI.h>
 #include <RadioLib.h>
 
@@ -15,12 +16,12 @@
 #define LORA_MISO  8
 
 // --- LoRa parameters ---
-static const float LORA_FREQ      = 915.0;   // MHz (US ISM band)
+static const float LORA_FREQ      = PIGEON_LORA_FREQUENCY_MHZ;
 static const float LORA_BW        = 125.0;   // kHz bandwidth
 static const uint8_t LORA_SF      = 9;       // Spreading factor
 static const uint8_t LORA_CR      = 7;       // Coding rate 4/7
 static const uint8_t LORA_SYNC    = 0x12;    // Private network sync word
-static const int8_t LORA_POWER    = 22;      // TX power in dBm (max for SX1262)
+static const int8_t LORA_POWER    = PIGEON_LORA_POWER_DBM;
 static const uint16_t LORA_PREAMBLE = 8;     // Preamble length
 static const float LORA_TCXO_V    = 1.8;     // TCXO voltage via DIO3
 
