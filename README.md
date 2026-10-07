@@ -4,6 +4,8 @@
 
 **Phone → BLE → Node → LoRa → Mesh → Node → BLE → Phone**
 
+**Check [local radio regulations](#radio-regulations) and configure the radio before flashing.** The default 915.0 MHz / 22 dBm settings are not a worldwide deployment preset.
+
 ## How It Works
 
 A Pigeon mesh node does three things:
@@ -22,12 +24,16 @@ When built with a relay endpoint and configured with WiFi credentials (via BLE),
 
 Nodes include an experimental implementation of the [Meshtastic](https://meshtastic.org/) LongFast wire format. Interoperation requires matching frequency, modem parameters, channel name/key, and compatible forwarding settings. This is not a complete Meshtastic implementation, and compatibility with arbitrary stock nodes has not been established. In particular, the fixed 915.0 MHz default does not follow Meshtastic's region/channel frequency selection; consult the [Meshtastic LoRa configuration](https://meshtastic.org/docs/configuration/radio/lora/) and verify actual settings on both devices.
 
+Meshtastic selects its frequency from the region, modem preset, and [frequency slot](https://meshtastic.org/docs/configuration/radio/lora/#frequency-slot); an unset slot uses the primary channel name's hash. Selecting LongFast alone does not match Pigeon's fixed frequency. Check the actual center frequency on the Meshtastic nodes and set `PIGEON_LORA_FREQUENCY_MHZ` in `include/pigeon_config.local.h` to match a locally permitted configuration. Meshtastic also has an advanced [frequency override](https://meshtastic.org/docs/configuration/radio/lora/#override-frequency), which bypasses its slot calculation and can select out-of-band frequencies; check local regulations before using it. Keep modem parameters and channel settings matched as well.
+
 - Pigeon envelopes are wrapped as protobuf `Data{portnum=256}` (PRIVATE_APP)
 - AES-128-CTR encryption with the default LongFast PSK
 - RSSI-based intelligent relay (closer nodes relay first, redundant rebroadcasts suppressed)
 - WiFi bridge is disabled in this mode
 - Switch modes via BLE: `{"lora_mode":"meshtastic"}` or `{"lora_mode":"native"}`
 - Protocol codec implemented in `src/pigeon.cpp`; no Meshtastic firmware is vendored
+
+**Airtime:** the `pigeon` target schedules discovery beacons every 30,000 ms plus 0–4,999 ms of jitter after the first beacon is due at about 30 seconds. A beacon carries up to seven 32-byte public keys from registered phones and known peers; the payload is 2–226 bytes before the Meshtastic wrapper. Execution delays or failed transmissions can make the observed interval longer. Beacons, forwarded packets, and application traffic all consume shared-channel airtime. Coordinate with the local mesh community and limit deployment size and traffic; this firmware does not enforce a duty-cycle budget. The limits and scheduling are in [src/pigeon.cpp](src/pigeon.cpp).
 
 ### Neighbor Discovery
 
@@ -69,12 +75,32 @@ This is experimental firmware. See [SECURITY.md](SECURITY.md) before deployment:
 
 ### Prerequisites
 
-Install Python 3.10 or newer and [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html), then install the same PlatformIO version used by CI:
+Use Python 3.10 or newer and PlatformIO Core **6.1.19**, matching CI. Use a **USB data cable**, not a charge-only cable, for flashing and serial monitoring.
+
+**macOS and Linux:** install Python and [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html) using the instructions for your OS, then:
 
 ```bash
 pipx install platformio==6.1.19
+pipx ensurepath
 pio --version
 ```
+
+Open a new terminal if `pio` is not found after updating PATH. On Linux, install the [PlatformIO udev rules](https://docs.platformio.org/en/stable/core/installation/udev-rules.html), reload the rules as documented, and reconnect the board. Alternatively, check the group owning the device with `ls -l /dev/ttyACM0` (substitute the port from `pio device list`). If that group is `dialout`, grant access with:
+
+```sh
+sudo usermod -aG dialout "$USER"
+```
+
+Log out and back in for group changes to take effect. Other distributions may use a different group; use the device's actual group rather than assuming `dialout`.
+
+**Windows (PowerShell):** with Python installed and the `py` command available, install the pinned Core with [pip](https://docs.platformio.org/en/stable/core/installation/methods/pypi.html):
+
+```powershell
+py -m pip install --user platformio==6.1.19
+py -m platformio --version
+```
+
+Add the installed Python user's Scripts directory to PATH and reopen PowerShell to use `pio`. You can also replace `pio` with `py -m platformio` in the commands below. Find the board's COM port with `pio device list` or Windows Device Manager. If you use a USB-UART adapter that needs a driver, obtain the matching driver from its manufacturer; do not install an unrelated adapter driver for the XIAO's native USB connection.
 
 The first build downloads the pinned ESP32 platform, toolchain, and libraries and requires internet access.
 
@@ -92,7 +118,7 @@ The other environments are radio development tools: `transmitter` sends a plaint
 
 ### Local relay and radio settings
 
-Copy `include/pigeon_config.example.h` to `include/pigeon_config.local.h` and edit it before building. The local file is ignored by Git. The default relay host is empty: BLE and LoRa remain available, while WiFi provisioning and internet bridging are disabled. Set `PIGEON_RELAY_HOST` to the hostname of a relay you operate or are authorized to use. The default port is 443 and path is `/v1/ws`.
+Copy [include/pigeon_config.example.h](include/pigeon_config.example.h) to `include/pigeon_config.local.h` and edit it before building. The local file is ignored by Git; defaults are defined in [include/pigeon_config.h](include/pigeon_config.h). The default relay host is empty: BLE and LoRa remain available, while WiFi provisioning and internet bridging are disabled. Set `PIGEON_RELAY_HOST` to the hostname of a relay you operate or are authorized to use. The default port is 443 and path is `/v1/ws`.
 
 Both relay connections validate TLS using the public ISRG Root X1 CA. If your relay uses a different CA, define `PIGEON_RELAY_ROOT_CA` as its PEM string in the local header. Do not put private keys or WiFi credentials in build configuration; provision WiFi through BLE in trusted surroundings.
 
@@ -100,55 +126,97 @@ Both relay connections validate TLS using the public ISRG Root X1 CA. If your re
 
 ### Flash
 
-```bash
-# List available serial ports
-pio device list
+**Before flashing, check [Radio regulations](#radio-regulations) and your local configuration.** A flashed node can transmit after startup. Attach an antenna suitable for the selected band.
 
-# Flash to a specific board
-pio run -e pigeon --target upload --upload-port /dev/cu.usbmodemXXXX
+List serial ports on any OS:
+
+```sh
+pio device list
 ```
 
-If the port is busy (BLE stack can lock USB CDC on ESP32S3), unplug the board and plug it back in, then flash immediately.
+Use the port reported for your board; these are examples, not fixed device identifiers:
+
+```sh
+# macOS
+pio run -e pigeon --target upload --upload-port /dev/cu.usbmodemXXXX
+
+# Linux (your port may instead be /dev/ttyUSB0)
+pio run -e pigeon --target upload --upload-port /dev/ttyACM0
+
+# Windows PowerShell (replace COM3 with your board's port)
+pio run -e pigeon --target upload --upload-port COM3
+```
+
+Close other serial monitors before uploading. If the board is not detected, check the USB data cable and reconnect it; if necessary, follow Seeed's [XIAO ESP32S3 bootloader instructions](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/) and run `pio device list` again because the port may change.
 
 ### Serial Monitor
 
-```bash
+Use the same port selected for flashing:
+
+```sh
+# macOS
 pio device monitor --port /dev/cu.usbmodemXXXX --baud 115200
+
+# Linux (or /dev/ttyUSB0)
+pio device monitor --port /dev/ttyACM0 --baud 115200
+
+# Windows PowerShell
+pio device monitor --port COM3 --baud 115200
 ```
 
 The `pigeon` target logs initialization and errors. Set `PIGEON_DEBUG_LOGS` to `1` in the local configuration header to enable routine packet and bridge traces. Logs omit peer identifiers, message/tunnel IDs, relay hostnames, SSIDs, IPs, and message payloads. The three radio development targets print packet counts and radio metrics. Review device logs before sharing them; timing and signal measurements can still reveal activity.
 
+## Radio regulations
+
+**Check local regulations before flashing or powering a flashed board.** All environments default to **915.0 MHz and 22 dBm** for the specified 915 MHz hardware. These defaults are not suitable worldwide and do not establish regulatory compliance, even in a region that permits use of the 902–928 MHz band. For example, [US rules for that band](https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15/subpart-C/section-15.247) include requirements beyond center frequency and transmit power.
+
+Check your regulator's current permitted bands, bandwidth, power limits (including antenna gain and radiated power), duty-cycle or other airtime limits, and equipment requirements. The firmware has no region selector, duty-cycle enforcement, or automatic transmit-power compliance. Changing only frequency and power does not establish compliance.
+
+To configure all four environments and both Pigeon radio modes, edit these definitions in the ignored `include/pigeon_config.local.h` after copying the example header:
+
+```cpp
+// Syntax example only; not a region-specific compliance prescription.
+#define PIGEON_LORA_FREQUENCY_MHZ 869.525
+#define PIGEON_LORA_POWER_DBM 14
+```
+
+Select values permitted for your location and equipment, use a radio board and antenna designed for that band, then rebuild before flashing. Keep the relay host empty unless you intentionally configure an authorized relay. No `platformio.ini` edits or build flags are needed for these local overrides.
+
+Compile-time checks in [include/pigeon_config.h](include/pigeon_config.h) enforce only the SX1262 hardware ranges of **150.0–960.0 MHz** and **-9 to 22 dBm**, as supported by [RadioLib 7.7.1](https://github.com/jgromes/RadioLib/blob/7.7.1/src/modules/SX126x/SX1262.h). They do **not** check regulatory limits or whether the shield and antenna support a selected frequency. A matching antenna must be connected whenever a target may transmit.
+
 ## LoRa Configuration
 
-The node supports two LoRa modes, selectable via BLE. The mode persists across reboots.
-
-All environments default to **915.0 MHz and 22 dBm** for the specified 915 MHz hardware. The firmware has no region selector, duty-cycle enforcement, or automatic transmit-power compliance. These defaults are not suitable worldwide and do not establish regulatory compliance. Before flashing, check the permitted frequency, power (including antenna gain), airtime, and equipment requirements where you will operate, and adjust the local configuration. A matching antenna must be connected whenever a target may transmit.
+The node supports two LoRa modes, selectable via BLE. The mode persists across reboots. Frequency and power below are build-time defaults; both modes use the same local overrides described in [Radio regulations](#radio-regulations).
 
 ### Pigeon Native (default)
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency | 915.0 MHz |
+| Frequency | 915.0 MHz (build-time default) |
 | Bandwidth | 125.0 kHz |
 | Spreading Factor | 9 |
 | Coding Rate | 4/7 |
 | Sync Word | 0x12 |
 | Preamble | 8 symbols |
-| TX Power | 22 dBm |
+| TX Power | 22 dBm (build-time default) |
 | Max Payload | ~2KB (fragmented) |
 
 ### Meshtastic Compatible
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency | 915.0 MHz |
+| Frequency | 915.0 MHz (build-time default) |
 | Bandwidth | 250.0 kHz |
 | Spreading Factor | 11 |
 | Coding Rate | 4/5 |
-| Sync Word | 0x2B |
+| Sync Word | 0x2B (RadioLib's one-byte representation) |
 | Preamble | 16 symbols |
-| TX Power | 22 dBm |
+| TX Power | 22 dBm (build-time default) |
+| Channel key | Public default LongFast AES-128 PSK (defined in `src/pigeon.cpp`) |
+| Channel hash | 0x08 (LongFast with the default PSK) |
 | Max Payload | 233 bytes (single packet) |
+
+The mode parameters are defined in [src/pigeon.cpp](src/pigeon.cpp). The Meshtastic wrapper uses a public channel key; message confidentiality depends on the client-encrypted Pigeon envelope, not that shared key.
 
 ## Mesh Protocol
 
