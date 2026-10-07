@@ -37,5 +37,3 @@ platformio.local.ini
 *.pcapng
 *.mobileprovision
 *.pfx
-
-# Local development tooling
