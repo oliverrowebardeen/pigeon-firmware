@@ -1,4 +1,4 @@
-// Pigeon Firmware - Phase 3: Transmitter
+// Pigeon - Transmitter test firmware
 // Sends "hello from pigeon" every 3 seconds at max power
 
 #include <Arduino.h>

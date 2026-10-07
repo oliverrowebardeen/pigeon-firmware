@@ -1,4 +1,4 @@
-// Pigeon Firmware - Phase 4: Bidirectional Mesh Relay
+// Pigeon - Mesh relay test firmware
 // Unified firmware — all nodes are equal, can send, receive, and relay.
 
 #include <Arduino.h>

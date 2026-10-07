@@ -1,6 +1,6 @@
 # Pigeon Mesh Node Firmware
 
-Firmware for Pigeon mesh network nodes. Each node is a self-contained LoRa + BLE relay that moves encrypted messages between phones over a decentralized mesh network. Nodes forward encrypted message content. Bridge registration/control messages addressed to the node are decrypted by the node.
+**Experimental, unaudited firmware for Pigeon mesh network nodes.** Each node is a self-contained LoRa + BLE relay that moves encrypted messages between phones over a decentralized mesh network. Nodes forward encrypted message content. Bridge registration/control messages addressed to the node are decrypted by the node.
 
 **Phone → BLE → Node → LoRa → Mesh → Node → BLE → Phone**
 
@@ -12,7 +12,7 @@ A Pigeon mesh node does three things:
 2. **LoRa mesh relay** — The node broadcasts those blobs over LoRa and relays messages from other nodes (flood routing with TTL and deduplication)
 3. **BLE notification** — When a LoRa message arrives, the node pushes it to any connected phone
 
-Nodes are equal peers. There's no coordinator, no routing table, no configuration. Plug one into USB power and it joins the mesh automatically.
+Nodes use flood routing without a coordinator. Nodes with matching radio parameters discover one another after startup; review the radio settings for your hardware and region before powering a flashed device.
 
 ### WiFi Bridge Mode
 
@@ -20,14 +20,14 @@ When built with a relay endpoint and configured with WiFi credentials (via BLE),
 
 ### Meshtastic Compatible Mode
 
-Nodes support a second LoRa mode that speaks the [Meshtastic](https://meshtastic.org/) LongFast wire format. When enabled, stock Meshtastic devices relay Pigeon traffic transparently — every Meshtastic node in the field becomes part of the Pigeon mesh.
+Nodes include an experimental implementation of the [Meshtastic](https://meshtastic.org/) LongFast wire format. Interoperation requires matching frequency, modem parameters, channel name/key, and compatible forwarding settings. This is not a complete Meshtastic implementation, and compatibility with arbitrary stock nodes has not been established. In particular, the fixed 915.0 MHz default does not follow Meshtastic's region/channel frequency selection; consult the [Meshtastic LoRa configuration](https://meshtastic.org/docs/configuration/radio/lora/) and verify actual settings on both devices.
 
 - Pigeon envelopes are wrapped as protobuf `Data{portnum=256}` (PRIVATE_APP)
 - AES-128-CTR encryption with the default LongFast PSK
 - RSSI-based intelligent relay (closer nodes relay first, redundant rebroadcasts suppressed)
 - WiFi bridge is disabled in this mode
 - Switch modes via BLE: `{"lora_mode":"meshtastic"}` or `{"lora_mode":"native"}`
-- No Meshtastic GPL code — implemented from the public wire format spec
+- Protocol codec implemented in `src/pigeon.cpp`; no Meshtastic firmware is vendored
 
 ### Neighbor Discovery
 
@@ -36,7 +36,7 @@ Nodes track who else is on the mesh from the packets they receive. Two in-memory
 - **Node table** — recently-heard Pigeon nodes (capacity 8, LRU eviction). Populated from any received packet, not just beacons, so a node that relays without beaconing is still discovered.
 - **Neighbor table** — per-node RSSI (capacity 16), used for the Meshtastic intelligent-relay delay calculation and for the OLED neighbor view.
 
-In Meshtastic mode, stock Meshtastic nodes are tracked alongside Pigeon nodes so the neighbor view shows the full local mesh. Periodic beacons (jittered to avoid TX collisions) keep tables fresh; stale entries expire after a few beacon intervals.
+In Meshtastic mode, received non-Pigeon traffic is counted separately in the neighbor view. These tables show recently heard senders, not a complete topology. Pigeon beacons run every 30–35 seconds; the first is due about 30 seconds after boot. Node and peer entries expire after about 90 seconds without traffic; the display also expires neighbor entries at 90 seconds.
 
 ## Hardware
 
@@ -69,15 +69,26 @@ This is experimental firmware. See [SECURITY.md](SECURITY.md) before deployment:
 
 ### Prerequisites
 
+Install Python 3 and [pipx](https://pipx.pypa.io/stable/installation/), then install the same PlatformIO version used by CI:
+
 ```bash
-brew install platformio
+pipx install platformio==6.1.19
+pio --version
 ```
+
+The first build downloads the pinned ESP32 platform, toolchain, and libraries and requires internet access.
 
 ### Build
 
 ```bash
+# Build all four environments, as CI does
+pio run
+
+# Or build only the BLE/LoRa node
 pio run -e pigeon
 ```
+
+The other environments are radio development tools: `transmitter` sends a plaintext test packet every 3 seconds, `receiver` listens and prints radio metrics, and `mesh` sends plaintext discovery beacons every 10 seconds. They do not implement encrypted phone messaging.
 
 ### Local relay and radio settings
 
@@ -91,7 +102,7 @@ Both relay connections validate TLS using the public ISRG Root X1 CA. If your re
 
 ```bash
 # List available serial ports
-ls /dev/cu.usb*
+pio device list
 
 # Flash to a specific board
 pio run -e pigeon --target upload --upload-port /dev/cu.usbmodemXXXX
@@ -110,6 +121,8 @@ The `pigeon` target logs initialization and errors. Set `PIGEON_DEBUG_LOGS` to `
 ## LoRa Configuration
 
 The node supports two LoRa modes, selectable via BLE. The mode persists across reboots.
+
+All environments default to **915.0 MHz and 22 dBm** for the specified 915 MHz hardware. The firmware has no region selector, duty-cycle enforcement, or automatic transmit-power compliance. These defaults are not suitable worldwide and do not establish regulatory compliance. Before flashing, check the permitted frequency, power (including antenna gain), airtime, and equipment requirements where you will operate, and adjust the local configuration. A matching antenna must be connected whenever a target may transmit.
 
 ### Pigeon Native (default)
 
@@ -215,7 +228,7 @@ Accepts JSON commands:
 
 | Command | Payload |
 |---------|---------|
-| Set WiFi | `{"ssid": "MyNetwork", "pass": "password123"}` |
+| Set WiFi | `{"ssid": "<your-ssid>", "pass": "<your-wifi-password>"}` |
 | Clear WiFi | `{"wifi": "off"}` |
 | Register phone | `{"type": "register", "pigeonID": "..."}` |
 | Switch LoRa mode | `{"lora_mode": "meshtastic"}` or `{"lora_mode": "native"}` |
@@ -228,13 +241,13 @@ Each node derives its mesh address from the ESP32's hardware MAC address (6 byte
 
 ## Deployment
 
-Nodes need only USB power (5V). No data connection to the host. Battery packs, phone chargers, wall adapters — anything with USB-C works. Scatter them around and they form a mesh automatically.
+After flashing and verifying suitable radio settings, nodes can run from a stable 5V USB supply without a host data connection. Use an appropriate supply and antenna. Test discovery, delivery, power consumption, and any bridge connection on your hardware before leaving a node running; unattended operation has not been validated.
 
 ## Project Structure
 
 ```
 src/
-  pigeon.cpp   — Production firmware (BLE + LoRa mesh + WiFi bridge)
+  pigeon.cpp   — Main experimental firmware (BLE + LoRa mesh + WiFi bridge)
   mesh.cpp     — Mesh-only test firmware (no BLE)
   tx.cpp       — Transmitter test firmware
   rx.cpp       — Receiver test firmware
@@ -254,4 +267,4 @@ MIT — see [LICENSE](LICENSE). Third-party code is listed in [THIRD-PARTY-LICEN
 
 ## Validation
 
-CI builds all four PlatformIO environments and runs host parser tests with address and undefined-behavior sanitizers. Direct dependencies are pinned to the versions in `platformio.ini`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the test command and required device-test notes. Successful builds do not verify radio behavior, interoperability, or unattended operation.
+CI builds all four PlatformIO environments and runs host parser tests with address and undefined-behavior sanitizers. There is no PlatformIO `native` test environment; run the standalone host test command in CONTRIBUTING.md. Direct dependencies are pinned to the versions in `platformio.ini`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the test command and required device-test notes. Successful builds do not verify radio behavior, interoperability, or unattended operation.

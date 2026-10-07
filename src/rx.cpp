@@ -1,4 +1,4 @@
-// Pigeon Firmware - Phase 3: Receiver
+// Pigeon - Receiver test firmware
 // Listens for LoRa packets using interrupt-driven receive, prints with RSSI
 
 #include <Arduino.h>
