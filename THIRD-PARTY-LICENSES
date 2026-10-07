@@ -1,10 +1,12 @@
-This file lists third-party code included in this repository and their licenses.
+This file lists vendored code and direct firmware dependencies. The MIT license
+in LICENSE applies to Pigeon source; each dependency retains its own license.
 
 ================================================================================
 curve25519-donna
 ================================================================================
 
 Source: lib/curve25519/curve25519-donna.c
+Upstream: https://github.com/agl/curve25519-donna
 License: BSD 3-Clause
 Copyright: 2008, Google Inc.
 
@@ -37,9 +39,60 @@ Build dependencies pinned in platformio.ini
 RadioLib 7.7.1 — MIT — licenses/RadioLib.txt
 ArduinoJson 7.4.3 — MIT — licenses/ArduinoJson.txt
 U8g2 2.36.18 — BSD-2-Clause code plus font-specific notices — licenses/U8g2.txt
-WebSockets 2.7.3 — LGPL-2.1 — licenses/WebSockets.txt
+WebSockets (arduinoWebSockets) 2.7.3 — LGPL-2.1-or-later — licenses/WebSockets.txt
+  Copyright (c) 2015 Markus Sattler. All rights reserved.
+  Its source headers allow LGPL version 2.1 or any later version; the
+  PlatformIO package metadata abbreviates this as LGPL-2.1.
+  Its bundled libb64 public-domain dedication is in licenses/libb64.txt.
+
+Upstream sources:
+  https://github.com/jgromes/RadioLib/tree/7.7.1
+  https://github.com/bblanchon/ArduinoJson/tree/v7.4.3
+  https://github.com/olikraus/u8g2/tree/2.36.18
+  https://registry.platformio.org/libraries/links2004/WebSockets/versions
+  https://github.com/Links2004/arduinoWebSockets
+
+The direct-library license copies were checked against the PlatformIO packages
+selected by platformio.ini. WebSockets 2.7.3 is a registry version; do not assume
+an upstream Git tag of the same name exists. Retain the exact package sources
+used for a binary release.
+
+OLED font
+=========
+Pigeon selects u8x8_font_5x8_r from U8g2 2.36.18. Its upstream notice is:
+  Fontname: -Misc-Fixed-Medium-R-Normal--8-80-75-75-C-50-ISO10646-1
+  Copyright: Public domain font.  Share and enjoy.
+Source: U8g2/src/clib/u8x8_fonts.c in the PlatformIO package.
+Font reference: https://github.com/olikraus/u8g2/wiki/fntgrpx11
+Other U8g2 fonts may have different licenses; check before changing the font.
+
+Distributing firmware binaries
+=============================
+The pigeon target statically links arduinoWebSockets, covered by LGPL 2.1 or
+later. Shipping only a firmware.bin and this notice is not sufficient. For a
+source-accompanied distribution under LGPL 2.1 section 6(a), provide:
+
+* A notice that arduinoWebSockets is used, its copyright notice, and the full
+  LGPL text (licenses/WebSockets.txt).
+* The complete corresponding library source, including changes and the scripts
+  and interface files used to build it. Identify modifications and their dates.
+* Pigeon source and/or linkable object files, configuration, build instructions,
+  and required build/link materials sufficient for recipients to modify the
+  library and relink the firmware. Preserve the exact dependency versions and
+  toolchain information. Do not include credentials or device identity data.
+* Terms that permit modification for the recipient's own use and reverse
+  engineering to debug those modifications.
+
+For downloads, offer those materials alongside the binary (section 6(d)). A
+generic link to an upstream repository or the pins in platformio.ini alone is
+not a replacement for the corresponding source/build materials. Other LGPL
+section 6 options exist; consult the full license for their conditions:
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
 
 The ESP32 Arduino framework and toolchain are supplied by espressif32 6.13.0.
 Their own component licenses also apply to distributed firmware. The MIT
 license for Pigeon source does not replace dependency licenses. Preserve
 upstream notices and review their distribution terms when shipping binaries.
+In particular, inventory the linked Arduino/ESP-IDF components and preserve
+their component notices with each binary distribution. This repository does
+not publish prebuilt firmware releases or claim to contain every SDK notice.
