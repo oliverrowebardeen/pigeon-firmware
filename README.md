@@ -329,6 +329,10 @@ platformio.ini — Build environments
 - [pigeon-ios](https://github.com/oliverrowebardeen/pigeon-ios) — iOS app
 - [pigeon-relay](https://github.com/oliverrowebardeen/pigeon-relay) — Relay server
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and validation requirements, and follow the [Code of Conduct](CODE_OF_CONDUCT.md) when participating.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Third-party code is listed in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
