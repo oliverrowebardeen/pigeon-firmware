@@ -69,7 +69,7 @@ This is experimental firmware. See [SECURITY.md](SECURITY.md) before deployment:
 
 ### Prerequisites
 
-Install Python 3 and [pipx](https://pipx.pypa.io/stable/installation/), then install the same PlatformIO version used by CI:
+Install Python 3.10 or newer and [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html), then install the same PlatformIO version used by CI:
 
 ```bash
 pipx install platformio==6.1.19

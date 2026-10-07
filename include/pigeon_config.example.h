@@ -8,7 +8,8 @@
 #define PIGEON_RELAY_PATH "/v1/ws"
 
 // TLS defaults to ISRG Root X1. For another CA, define PIGEON_RELAY_ROOT_CA
-// as a PEM string literal here. Never disable certificate validation.
+// as an escaped PEM string literal here (use \n for newlines). Never disable
+// certificate validation.
 
 // Check the radio module, antenna, and local requirements before transmitting.
 // All four environments use these values, including both pigeon radio modes.
