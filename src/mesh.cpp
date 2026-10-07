@@ -70,12 +70,6 @@ void IRAM_ATTR onReceive() {
     rxFlag = true;
 }
 
-// Format MAC address as hex string
-void macToStr(const uint8_t* mac, char* buf) {
-    snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 // Check if two addresses match
 bool addrMatch(const uint8_t* a, const uint8_t* b) {
     return memcmp(a, b, ADDR_LEN) == 0;
@@ -180,12 +174,7 @@ void meshSend(const uint8_t* dest, const uint8_t* payload, uint8_t payloadLen) {
     // Add to dedup so we don't re-process our own relayed messages
     addDedup(pkt.sender, pkt.msgID);
 
-    char senderStr[18], destStr[18];
-    macToStr(pkt.sender, senderStr);
-    macToStr(pkt.dest, destStr);
-
-    Serial.printf("[SENT] from=%s to=%s msgID=%04X ttl=%d len=%d\n",
-                  senderStr, destStr, pkt.msgID, pkt.ttl, pkt.payloadLen);
+    Serial.printf("[SENT] ttl=%d len=%d\n", pkt.ttl, pkt.payloadLen);
 
     if (!meshTransmit(pkt)) {
         Serial.println("[SENT] TX FAILED");
@@ -213,13 +202,9 @@ void handleReceived() {
         return;
     }
 
-    char senderStr[18], destStr[18];
-    macToStr(pkt.sender, senderStr);
-    macToStr(pkt.dest, destStr);
-
     // Check dedup
     if (isDuplicate(pkt.sender, pkt.msgID)) {
-        Serial.printf("[DEDUP] from=%s msgID=%04X (already seen)\n", senderStr, pkt.msgID);
+        Serial.println("[DEDUP] Already seen");
         radio.startReceive();
         return;
     }
@@ -230,21 +215,18 @@ void handleReceived() {
 
     if (forUs) {
         // Deliver to this node
-        pkt.payload[pkt.payloadLen < MAX_PAYLOAD ? pkt.payloadLen : MAX_PAYLOAD - 1] = '\0';
-        Serial.printf("[RECV] from=%s to=%s msgID=%04X ttl=%d RSSI=%.1f SNR=%.1f\n",
-                      senderStr, destStr, pkt.msgID, pkt.ttl, rssi, snr);
-        Serial.printf("       payload: \"%s\"\n", (char*)pkt.payload);
+        Serial.printf("[RECV] len=%d ttl=%d RSSI=%.1f SNR=%.1f\n",
+                      pkt.payloadLen, pkt.ttl, rssi, snr);
     }
 
     // Relay if TTL > 0 (relay broadcast messages AND messages not for us)
     if (!addrMatch(pkt.sender, nodeAddr)) {
         if (pkt.ttl <= 1) {
-            Serial.printf("[DROP] from=%s msgID=%04X TTL expired\n", senderStr, pkt.msgID);
+            Serial.println("[DROP] TTL expired");
         } else {
             // Decrement TTL and relay
             pkt.ttl--;
-            Serial.printf("[RELAY] from=%s to=%s msgID=%04X ttl=%d->%d\n",
-                          senderStr, destStr, pkt.msgID, pkt.ttl + 1, pkt.ttl);
+            Serial.printf("[RELAY] ttl=%d->%d\n", pkt.ttl + 1, pkt.ttl);
             meshTransmit(pkt);
         }
     }
@@ -259,12 +241,8 @@ void setup() {
     // Get MAC address as node identity
     esp_efuse_mac_get_default(nodeAddr);
 
-    char nodeStr[18];
-    macToStr(nodeAddr, nodeStr);
-
     Serial.println("=================================");
     Serial.println("  Pigeon Mesh Node");
-    Serial.printf("  ID: %s\n", nodeStr);
     Serial.println("=================================");
     Serial.println();
 

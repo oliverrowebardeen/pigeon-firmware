@@ -14,3 +14,6 @@
 // All four environments use these values, including both pigeon radio modes.
 #define PIGEON_LORA_FREQUENCY_MHZ 915.0
 #define PIGEON_LORA_POWER_DBM 22
+
+// Routine packet/bridge tracing for the pigeon target (disabled by default).
+#define PIGEON_DEBUG_LOGS 0

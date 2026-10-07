@@ -108,13 +108,12 @@ void loop() {
     if (state == RADIOLIB_ERR_NONE) {
         rxCount++;
         int len = radio.getPacketLength();
-        buf[len] = '\0';
 
         Serial.print("[RX #");
         Serial.print(rxCount);
-        Serial.print("] \"");
-        Serial.print((char*)buf);
-        Serial.print("\"  RSSI: ");
+        Serial.print("] bytes: ");
+        Serial.print(len);
+        Serial.print("  RSSI: ");
         Serial.print(radio.getRSSI());
         Serial.print(" dBm  SNR: ");
         Serial.print(radio.getSNR());

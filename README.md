@@ -105,6 +105,8 @@ If the port is busy (BLE stack can lock USB CDC on ESP32S3), unplug the board an
 pio device monitor --port /dev/cu.usbmodemXXXX --baud 115200
 ```
 
+The `pigeon` target logs initialization and errors. Set `PIGEON_DEBUG_LOGS` to `1` in the local configuration header to enable routine packet and bridge traces. Logs omit peer identifiers, message/tunnel IDs, relay hostnames, SSIDs, IPs, and message payloads. The three radio development targets print packet counts and radio metrics. Review device logs before sharing them; timing and signal measurements can still reveal activity.
+
 ## LoRa Configuration
 
 The node supports two LoRa modes, selectable via BLE. The mode persists across reboots.
@@ -218,7 +220,7 @@ Accepts JSON commands:
 | Register phone | `{"type": "register", "pigeonID": "..."}` |
 | Switch LoRa mode | `{"lora_mode": "meshtastic"}` or `{"lora_mode": "native"}` |
 
-Sends notifications with bridge status updates and peer presence.
+Sends notifications with bridge state and capacity, plus separate peer presence updates. Bridge status omits the SSID and local IP; client UIs should treat those fields as optional.
 
 ## Node Identity
 
