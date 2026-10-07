@@ -10,6 +10,6 @@ Message content stays encrypted by the client, but radio headers, presence, pack
 
 BLE provisioning/control is currently unauthenticated. A nearby device can change WiFi or radio settings. Provision only in a trusted physical environment; authenticated administration remains necessary before unattended deployment in hostile locations. Encrypted NVS credentials do not protect against extraction from a device whose flash and identity key can be read. Physical security, ESP32 flash encryption, and secure boot require a separate deployment design.
 
-Security fixes currently target `main`; there are no supported stable releases. Reports are handled on a best-effort basis without a guaranteed response time.
+Security fixes target `main`; there are no supported releases. Reports are handled on a best-effort basis without a guaranteed response time.
 
 The default build does not select an internet relay. Operators must configure an authorized endpoint and preserve TLS certificate validation. Bridge status notifications omit the SSID and local IP, but peer discovery advertises public keys/IDs and native LoRa headers contain hardware-derived addresses. The local OLED also shows the node's ID. These are stable, observable identifiers, not an anonymity mechanism. Routine serial tracing is disabled by default; review even redacted diagnostics before publishing them.
